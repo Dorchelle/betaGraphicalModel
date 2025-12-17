@@ -46,7 +46,88 @@ Matrix multiplyMatrices(const Matrix& A, const Matrix& B) {
 }
 
 //------------------------------ cholesky decomposition --------------------------//
-Matrix cholesky(const Matrix& A) {
+
+Matrix cholesky(const Matrix& A_in) {
+    size_t n = A_in.size();
+    if (n == 0) return Matrix{};
+    if (n != A_in[0].size()) {
+        throw std::invalid_argument("Erreur cholesky: la matrice A doit être carrée.");
+    }
+
+    // Copie locale pour éventuellement ajouter un petit jitter
+    Matrix A = A_in;
+
+    // Petit jitter pour stabiliser numériquement (si la matrice est presque SPD)
+    const double jitter = 1e-8;
+    for (size_t i = 0; i < n; ++i) {
+        A[i][i] += jitter;
+    }
+
+    // Paramètres de tolérance
+    const double tol_neg  = 1e-12;  // tolérance sur "négatif numériquement"
+    const double min_diag = 1e-18;  // seuil minimal pour considérer un pivot comme nul
+
+    Matrix L(n, Vector(n, 0.0));
+
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j <= i; ++j) {
+            double sum = 0.0;
+
+            if (j == i) {
+                // Diagonale : L[i,i] = sqrt(A[i,i] - Σ_k L[i,k]^2)
+                for (size_t k = 0; k < j; ++k) {
+                    sum += L[i][k] * L[i][k];
+                }
+
+                double value = A[i][i] - sum;
+
+                // Si value est légèrement négatif (erreurs d'arrondi), on le remonte à une petite valeur positive
+                if (value < 0.0 && std::abs(value) < tol_neg) {
+                    // std::cerr << "cholesky: correction numérique diag i=" << i
+                    //           << " value=" << value << " -> " << tol_neg << "\n";
+                    value = tol_neg;
+                }
+
+                if (value <= 0.0) {
+                    std::cerr << "Erreur cholesky: diag <= 0 à i = " << i
+                              << ", A[i][i] = " << A[i][i]
+                              << ", sum = " << sum << ", value = " << value << "\n";
+                    throw std::runtime_error(
+                        "Erreur cholesky: matrice non définie positive (diagonale <= 0)."
+                    );
+                }
+
+                L[i][i] = std::sqrt(value);
+            } else {
+                // Hors diagonale : L[i,j] = (A[i,j] - Σ_k L[i,k]L[j,k]) / L[j,j]
+                for (size_t k = 0; k < j; ++k) {
+                    sum += L[i][k] * L[j][k];
+                }
+
+                if (std::abs(L[j][j]) < min_diag) {
+                    std::cerr << "Erreur cholesky: pivot quasi nul à j = " << j
+                              << ", L[j][j] = " << L[j][j] << "\n";
+                    throw std::runtime_error(
+                        "Erreur cholesky: division par zéro (L[j][j] ~ 0)."
+                    );
+                }
+
+                L[i][j] = (A[i][j] - sum) / L[j][j];
+            }
+        }
+    }
+
+    return L;
+}
+
+
+
+
+
+
+
+
+/*Matrix cholesky(const Matrix& A) {
     size_t n = A.size();
     if (n == 0) return Matrix();
     if (n != A[0].size()) {
@@ -91,7 +172,7 @@ Matrix cholesky(const Matrix& A) {
     }
     
     return L;
-}
+}*/
 
 // ------------ calculation of the scalar product of two vectors ---------
 double vectorDotProduct(const Vector& A, const Vector& B) {

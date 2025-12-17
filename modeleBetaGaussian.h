@@ -2,13 +2,15 @@
 
 #ifndef MODELE_H
 #define MODELE_H
+#include <vector>
+#include <cmath>
 #include "fonctions.h"
 #include "prior.h"
 #include "fullConditional.h"
 #include "sampling.h"
 #include "usefullFunctions.h"
-#include <vector>
-#include <cmath>
+#include "matricesCalculations.h"
+
 // Définitions de types pour la lisibilité
 using Matrix = std::vector<std::vector<double>>;
 using Vector = std::vector<double>;
@@ -45,10 +47,13 @@ struct HyperParameters
  * Fonction principale MCMC Beta-Gaussien.
  * Orchestre le chargement, l'initialisation, le burn-in et l'échantillonnage final.
  */
-BetaGaussienResult betaGaussien(const std::string& data1, const std::string& data2, 
-    size_t burn_in = 1000, 
-    size_t n_sample = 1000, 
-    HyperParameters defaults, 
+
+BetaGaussienResult betaGaussien(
+    const std::string& data1,
+    const std::string& data2,
+    std::size_t burn_in   = 1000,
+    std::size_t n_sample  = 1000,
+    HyperParameters defaults = HyperParameters{},  // ou = {}
     bool State = true
 );
 

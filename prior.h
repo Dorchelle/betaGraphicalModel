@@ -16,17 +16,16 @@
 double priorSigma(double a_sigma, double b_sigma);
 Vector priorXI(double a_xi, double b_xi, int p);
 Matrix adjacencyMatrix(int p); 
-Vector calculateCs(const Vector& SS);
 // --- 2. Fonctions d'Échantillonnage de Priors (Gamma, Beta) ---
 // Note: Ces fonctions supposent que meanSS retourne un vecteur de taille Ncl
 Vector priorGamma(const Matrix& theta, double b, const Vector& SS);
 Vector priorBeta(const Matrix& lambda_1, double b, const Vector& SS);
-Vector priorGamma1(const Matrix& theta, double b, const Vector& SS);
 Vector priorBeta1(const Matrix& lambda_1, double b, const Vector& SS);
-
+Vector priorGamma1(const Matrix& theta, double b, const Vector& SS);
 // --- 3. Échantillonneurs de Processus Stochastiques ---
-Matrix priorNormal(const Matrix& B, double sigma, double xi, int T1);
-Matrix priorLogNormal(const Matrix& B, double sigma, double xi, int T1);
+Matrix priorNormal(const Matrix& B, double sigma, const Vector& xi, int T1);
+// Distribution LogNormal
+Matrix priorLogNormal(const Matrix& B, double sigma, const Vector& xi, int T1);
 
 // --- 4. Fonction de Partition (Dirichlet Process) ---
 struct PriorPartitionResult {

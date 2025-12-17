@@ -13,9 +13,16 @@
 #include <algorithm>
 #include <map> // Nécessaire pour la ré-indexation
 // Définition de types pour simplifier la lecture
+extern "C" {
+    #include <gsl/gsl_rng.h>
+    #include <gsl/gsl_randist.h>
+    #include <gsl/gsl_matrix.h>
+    #include <gsl/gsl_blas.h>
+    #include <gsl/gsl_linalg.h>
+}
 using Matrix = std::vector<std::vector<double>>;
 using Vector = std::vector<double>;
-
+using StringVector = std::vector<std::string>;
 
 // Structure pour contenir les résultats de chargesDonnees
 struct DonneesChargees {
@@ -23,6 +30,7 @@ struct DonneesChargees {
     int l;
     Matrix IDH;
     Vector IDHPre;
+    //StringVector Ville;  // differents states
     int T1;
 };
 
@@ -48,6 +56,7 @@ struct DonneesPollution {
 struct MatricesPrecision {
     Matrix Omega; // Matrice de Précision (Omega = Psi^T * Psi)
     Matrix Sigma; // Matrice de Covariance (Sigma = Omega^-1)
+    double detb;
 };
 
 
@@ -83,7 +92,8 @@ Matrix XXt(const Vector& X);
 KmeansResult kmeansSS(const Matrix& X, int T1, int K_init);
 // Remplace factoriel(n)
 long  factoriel(int n);
-
+// Donnees CSV sans en tete
+Matrix readCSV(const std::string &filename);
 // Remplace trace(M)
 double trace(const Matrix& M);
 Vector calculateCs(const Vector& SS);
@@ -118,6 +128,7 @@ Matrix covJPoll(const Vector& S, const Matrix& IDH, int j, const Vector& Cs, int
 // ... (Inclusions et définitions de types)
 // Remplace mubarj : Calcule le vecteur moyen pour les éléments du cluster j
 Vector mubarj(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l);
+double numpySumSlice(const Matrix& M1, size_t r1, size_t c1_start, size_t c1_end, const Matrix& M2, size_t c2_start, size_t c2_end, size_t c2_fixed);
 double multigammaln(double a, int p);
 // Remplace numerateur : Calcule le numérateur du ratio de Bayes (log-échelle)
 double numerateur(const Vector& Cs, int j,double b_j, int l);
@@ -140,21 +151,55 @@ double constanteNormalisation(const Matrix& A, double b, const Matrix& T, size_t
 Matrix structureMatrice(const Matrix& Omega);
 Matrix retirerUnNoeud(const Matrix& Omega);
 PropAjoutRetrait ajoutUnNoeud(const Matrix& aOmega);
-Matrix S_epsi(const Matrix& theta, Vector xi);
-double logLikhoodBetaJ(const Matrix& X, const Matrix& ALPHA, const Matrix& BETA, const Vector& S, int j);
+Matrix S_epsi(const Matrix& theta, const Vector& xi);
+double logLikhoodBetaJ(const Matrix& X, const double& ALPHA, const double& BETA, const Vector& S, int j);
 double poissonGammaLog(int y, double alpha, double beta);
 double logLikhoodPoissonGammaJ(const Matrix& X, const Matrix& ALPHA, const Matrix& BETA, const Vector& S, int j);
 double logLikhood(const Matrix& X, const Matrix& ALPHA, const Matrix& BETA);
 Matrix extractMatrix(const Matrix& B, int j, const Vector& S, int Nj);
 Vector extractVect(const Vector& U, int j, const Vector& S, int Nj);
 std::pair<int, int> isValueInMatrix(const Vector& SS, int i, int t, int p);
-Vector meanSS(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l);
+double meanSS(const Matrix& X,const Vector& S, int j);
 // Fonction utilitaire nécessaire pour l'étape MH
 Matrix AddMatrices(const Matrix& A, const Matrix& B);
 Matrix DivideMatrixByScalar(const Matrix& M, double C);
 // Fonctions utilitaires matricielles nécessaires pour le MCMC
 Matrix SubtractMatrices(const Matrix& A, const Matrix& B); // A - B
 double SumAbsMatrix(const Matrix& M); // np.sum(np.abs(M))
-MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_init, Matrix& Psi_init, Matrix& T_init, double b, const Matrix& S_epsi, double neta, Matrix& A_Theta, int T_periods);
+//MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_init, Matrix& Psi_init, Matrix& T_init, double b, const Matrix& S_epsi, double neta, Matrix& A_Theta, int T_periods);
+MCMC_Result_Full MCMC(
+    double lambda_0,
+    const Matrix& B_in,
+    const Matrix& Sigma,
+    double detB_init,
+    const Matrix& Psi_init,
+    const Matrix& T_init,
+    double b,
+    const Matrix& S_epsi,
+    double neta,
+    Matrix& A_Theta,
+    int T_periods,
+    bool verbose // ajout d'un flag pour contrôler les prints
+);
+double crpsFromSamples(const std::vector<double>& y_samples, double x_obs);
+Vector crpsVector(const Matrix& Y_sample,const Vector& y_obs);
+Vector rowMeans(const Matrix& M);
+void exportMatrixTxt(const Matrix& M, const std::string& filename);
+void print_vector(const Vector& vec, const std::string& name = "Vecteur");
+void saveMatrixCSV(const Matrix& M, const std::string& filename);
+void saveVectorTXT(const std::vector<double>& v, const std::string& filename);
+void saveVectorCSV(const std::vector<double>& v, const std::string& filename) ;
+Vector RowsStd(const Matrix& mat);
+Vector VectorDifference(const Vector& v1, const Vector& v2);
+double mean(const std::vector<double>& v);
+Vector linspace(double a, double b, std::size_t n);
+void plotCurveToPNG(const std::vector<double>& x,
+                    const std::vector<double>& y,
+                    const std::string& filename,
+                    const std::string& title,
+                    const std::string& xlabel = "x",
+                    const std::string& ylabel = "y");
+size_t index_of_min(const std::vector<double>& v);
+
 // ... (Autres déclarations de fonctions)
 #endif // FONCTIONS_H

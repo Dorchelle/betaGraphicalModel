@@ -1,3 +1,4 @@
+#include <vector>
 // full_conditional.cpp
 #include <stdexcept>
 #include <iostream>
@@ -9,7 +10,8 @@
 #include "fullConditional.h"
 #include "sampling.h"
 #include "usefullFunctions.h"
-
+using Matrix = std::vector<std::vector<double>>;
+using Vector = std::vector<double>;
 
 // Déclaration d'un générateur aléatoire (supposé défini dans prior.cpp ou un fichier commun)
 extern std::mt19937 generator_prior; // Utilisation du générateur du module prior
@@ -22,23 +24,159 @@ extern Matrix XXt(const Vector& X);
 extern Matrix multiplyMatrices(const Matrix& A, const Matrix& B);
 //extern double vectorDotProduct(const Vector& A, const Vector& B);
 extern double trace(const Matrix& M);
-extern double numerateur(const Vector& CS, int j,double b_j, int l);
+extern double numerateur(const Vector& Cs, int j,double b_j, int l);
+extern double denominateur(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l, double b_j);
 extern double denominateurPoll(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l, double b_j);
 extern double poissonGammaLog(int y, double alpha, double beta);
 extern std::pair<int, int> isValueInMatrix(const Vector& SS, int i, int t, int p);
 extern int sampleDiscrete(const Vector& probabilities); // Échantillonne multinomial
+extern double sampleGamma(double shape, double scale);
+double sampleBeta(double alpha, double beta);
 extern size_t countNonzeroClusterJ(const Vector& SS, int j);
 //extern void deleteLastElement(Vector& vec); // Supprime le dernier élément
 // --- Fonction Utilitaires pour Logarithmes et Aléatoire ---
 // Équivalent à np.log(st.uniform.rvs(0,1))
 // ... (Ajout des autres fonctions dans l'ordre) ...
 
+
 /**
- * Traduction de FullLambda(...)
- * Échantillonne la variable latente lambda_1 par Metropolis-Hastings (Log-Normal).
- * @param lambda_1: Matrice lambda actuelle (modifiée in-place).
+ * Traduction de Full_theta(...)
+ * Échantillonne la variable latente theta par Metropolis-Hastings (Log-Normal).
  */
-Matrix fullLambda(const Vector& mu, double mu_b, Vector xi, const Matrix& B, Matrix& lambda_1, double sigma, const Vector& SS, int T1) {
+Matrix fullTheta(const Vector& alpha, double alpha_b, const Vector& xi, const Matrix& B, Matrix& theta, double sigma, const Vector& SS, int T1) {
+    size_t p = B.size();
+    
+    //if (p == 0 || T1 == 0) return theta;
+    Matrix theta_star_mat = theta; // Matrice pour stocker la proposition complète
+
+    // --- Période t=0 (Initialisation) ---
+    for (size_t i = 0; i < p; ++i) {
+        size_t t = 0;
+        double theta_i0 = theta[i][0];
+        size_t flat_idx = i + t * p;
+        
+        try {
+            double B_ii = B[i][i];
+            if (std::abs(B_ii) < 1e-12) continue;
+            
+            double var_1 = sigma / B_ii;
+            if (var_1 <= 0.0) continue;
+            
+            // 1. Proposer theta_star_i par Log-Normale
+            double log_mu_prop = std::log(theta_i0); 
+            std::normal_distribution<double> normal_prop(log_mu_prop, std::sqrt(var_1));
+            
+            double theta_star_i = std::exp(normal_prop(generator_prior));
+            if (theta_star_i < 0.0001) theta_star_i = 0.0001;
+            
+            // 2. Calculer le ratio d'acceptation tp (Log-Alpha)
+            double tp = 0.0;
+            double log_theta_star_i = std::log(theta_star_i);
+            double log_theta_i0 = std::log(theta_i0);
+
+            // Terme 1: Prior Gaussien Temporel (t=0) - Log-Normal ratio
+            // np.sum(B[i,:]*log(theta[:,0]))
+            double sum_B_log_theta = 0.0;
+            for (size_t k = 0; k < p; ++k) {
+                sum_B_log_theta += B[i][k] * std::log(theta[k][0]);
+            }
+            
+            tp += -0.5 * B_ii / sigma;
+            tp *= (log_theta_star_i - log_theta_i0);
+            tp *= (-2.0 * sum_B_log_theta / B_ii + log_theta_star_i + log_theta_i0);
+
+            // Terme 2: Prior de Cluster (Log P(theta*)/P(theta) - Log(Proposal))
+            size_t j = static_cast<size_t>(std::round(SS[flat_idx])); 
+            if (j >= alpha.size()) continue; // Vérification du cluster
+            
+            double diff_j = theta_star_i - theta_i0;
+
+            // tp+=-1*math.lgamma(theta_star[i]) +math.lgamma(theta[i,0])
+            tp += -std::lgamma(theta_star_i) + std::lgamma(theta_i0);
+            
+            // tp+=diff_j*(0.5*np.log(alpha[j]) +np.log(alpha_b))
+            tp += diff_j * (0.5 * std::log(alpha[j]) + std::log(alpha_b));
+
+            // 3. Décision d'Acceptation
+            if (tp > logUniformRvs()) {
+                theta[i][0] = theta_star_i;              
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Erreur Full_theta (t=0, i=" << i << "): " << e.what() << ". Rejet." << std::endl;
+        }                                                                             
+    }
+    
+    // --- Périodes t > 0 ---
+    for (size_t t = 0; t < T1 - 1; ++t) {
+        for (size_t i = 0; i < p; ++i) {
+            size_t t_plus_1 = t + 1;
+            size_t flat_idx = i + t_plus_1 * p;
+            double theta_i_tplus1 = theta[i][t_plus_1];
+            
+            try {
+                 double B_ii = B[i][i];
+                 if (std::abs(B_ii) < 1e-12) continue;
+                 double var_1 = sigma / B_ii;
+                 if (var_1 <= 0.0) continue;
+                 
+                 // 1. Calcul de la moyenne Log-Normale (moy_1)
+                 // moy_1 = np.sum(B[i,:]*(0.5*xi*log(theta[:,t]) -0.5*log(theta[:,t+1])))/B[i,i] +log(theta[i,t+1])
+                 double sum_B_log_theta_pred = 0.0;
+                 for (size_t k = 0; k < p; ++k) {
+                     // Terme : xi*log(theta[:,t]) - log(theta[:,t+1])
+                     sum_B_log_theta_pred += B[i][k] * (xi[k] * std::log(theta[k][t]) - std::log(theta[k][t + 1]));
+                 }
+                 double moy_1 = sum_B_log_theta_pred * 0.5 / B_ii + std::log(theta_i_tplus1);
+                 
+                 // 2. Proposition theta_star_i ~ Log-Normale
+                 std::normal_distribution<double> normal_prop(moy_1, std::sqrt(var_1));
+                 double theta_star_i = std::exp(normal_prop(generator_prior));
+                 if (theta_star_i < 0.00001) theta_star_i = 0.00001;
+
+                 // 3. Calcul du ratio d'acceptation (tp)
+                 double tp = 0.0;
+                 double log_theta_star_i = std::log(theta_star_i);
+                 double log_theta_i_tplus1 = std::log(theta_i_tplus1);
+                 
+                 // Terme 1: Prior Temporel (t>0)
+                 double sum_B_current = 0.0;
+                 for (size_t k = 0; k < p; ++k) {
+                     // Terme : log(theta[:,t+1]) - xi*log(theta[:,t])
+                     sum_B_current += B[i][k] * (std::log(theta[k][t_plus_1]) - xi[k] * std::log(theta[k][t]));
+                 }
+                 
+                 // Ligne C++ : tp=tp*(0.25*(log(theta_star[i])-log(theta[i,t+1]))  +np.sum(B[i,:]*(-0.5*xi*log(theta[:,t]) +0.5*log(theta[:,t+1])))/B[i,i])
+                 tp += -0.5 * B_ii / sigma;
+                 tp *= (log_theta_star_i - log_theta_i_tplus1);
+                 tp *= (0.25 * (log_theta_star_i - log_theta_i_tplus1) + sum_B_current * 0.5 / B_ii);
+
+                 // Terme 2: Prior de Cluster (Log P(theta*)/P(theta))
+                 size_t j = static_cast<size_t>(std::round(SS[flat_idx])); 
+                 if (j >= alpha.size()) continue; 
+                 
+                 double diff_j = theta_star_i - theta_i_tplus1;
+                 
+                 tp += -std::lgamma(theta_star_i) + std::lgamma(theta_i_tplus1);
+                 tp += diff_j * (0.5 * std::log(alpha[j]) + std::log(alpha_b));
+
+                 // 3. Décision d'Acceptation
+                 if (tp > logUniformRvs()) {
+                     theta[i][t_plus_1] = theta_star_i;              
+                 }
+            } catch (const std::exception& e) {
+                std::cerr << "Erreur Full_theta (t>0, i=" << i << ", t=" << t_plus_1 << "): " << e.what() << ". Rejet." << std::endl;
+            }
+        } // Fin de la boucle i
+    } // Fin de la boucle t
+    
+    return theta;
+}
+
+
+
+//Matrix fullLambda(const Vector& mu, double mu_b, Vector xi, const Matrix& B, Matrix& lambda_1, double sigma, const Vector& SS, int T1);
+
+Matrix fullLambda(const Vector& mu, double mu_b, const Vector& xi, const Matrix& B, Matrix& lambda_1, double sigma, const Vector& SS, int T1) {
     size_t p = B.size();
     if (p == 0) return lambda_1;
 
@@ -46,52 +184,46 @@ Matrix fullLambda(const Vector& mu, double mu_b, Vector xi, const Matrix& B, Mat
     for (size_t i = 0; i < p; ++i) {
         size_t t = 0;
         double lambda_i0 = lambda_1[i][0];
+        size_t flat_idx = i + t * p;
         
         try {
             double B_ii = B[i][i];
-            if (std::abs(B_ii) < 1e-12) continue; // Éviter la division par zéro
-
+            if (std::abs(B_ii) < 1e-12) continue; // Division par zéro
             double var_1 = sigma / B_ii;
-            if (var_1 <= 0.0) continue; // La variance doit être positive
+            if (var_1 <= 0.0) continue;
             
             // 1. Proposer lambda_star_i par Log-Normale
+            // Log-Normal centrée sur log(lambda_i0) avec variance var_1
             double log_mu_prop = std::log(lambda_i0); 
             std::normal_distribution<double> normal_prop(log_mu_prop, std::sqrt(var_1));
             
             double lambda_star_i = std::exp(normal_prop(generator_prior));
-            
             if (lambda_star_i < 0.0001) lambda_star_i = 0.0001;
 
             // 2. Calculer le ratio d'acceptation tp (Log-Alpha)
-
-            // Terme 1: Prior Gaussien Temporel (simplifié du ratio Log-Normal)
+            double tp = 0.0;
             double log_lambda_star_i = std::log(lambda_star_i);
             double log_lambda_i0 = std::log(lambda_i0);
 
-            // Calcul de Sum(B[i,:] * log(lambda[:,0]))
+            // Terme 1: Prior Gaussien Temporel (t=0)
             double sum_B_log_lambda = 0.0;
             for (size_t k = 0; k < p; ++k) {
-                sum_B_log_lambda += B[i][k] * std::log(lambda_1[k][0]);
+                sum_B_log_lambda += B[i][k] * std::log(lambda_1[k][0]); // B[i,:]*log(lambda[:,0])
             }
             
-            double tp = -0.5 * B_ii / sigma;
+            tp += -0.5 * B_ii / sigma;
             tp *= (log_lambda_star_i - log_lambda_i0);
             tp *= (-2.0 * sum_B_log_lambda / B_ii + log_lambda_star_i + log_lambda_i0);
 
-            // Terme 2: Prior Bêta du Cluster (impliquant lgamma)
-            size_t j = static_cast<size_t>(std::round(SS[i])); 
-            if (j >= mu.size()) continue; // Vérification de l'indice du cluster
+            // Terme 2: Prior Bêta du Cluster (Log P(lambda*)/P(lambda) - Log(Proposal))
+            size_t j = static_cast<size_t>(std::round(SS[flat_idx])); 
+            if (j >= mu.size()) continue; 
             
             double diff_j = lambda_star_i - lambda_i0;
 
-            // tp+=diff_j*np.log(mu[j])
+            // Termes de vraisemblance Bêta simplifiés
             tp += diff_j * std::log(mu[j]); 
-            
-            // Termes Gamma (de la PDF de la Bêta / Priors)
-            // tp+=math.lgamma(lambda_1_star[i]+mu_b)-math.lgamma(lambda_1[i,0]+mu_b)
             tp += std::lgamma(lambda_star_i + mu_b) - std::lgamma(lambda_i0 + mu_b);
-            
-            // tp+=-math.lgamma(lambda_1_star[i])+math.lgamma(lambda_1[i,0])
             tp += -std::lgamma(lambda_star_i) + std::lgamma(lambda_i0);
             
             // 3. Décision d'Acceptation
@@ -99,97 +231,75 @@ Matrix fullLambda(const Vector& mu, double mu_b, Vector xi, const Matrix& B, Mat
                 lambda_1[i][0] = lambda_star_i;              
             }
         } catch (const std::exception& e) {
-            std::cerr << "Erreur fullLambda (t=0, i=" << i << "): " << e.what() << ". Rejet." << std::endl;
+            std::cerr << "Erreur Full_lambda (t=0, i=" << i << "): " << e.what() << ". Rejet." << std::endl;
         }                                                                             
     }
     
     // --- Périodes t > 0 ---
-    // La logique est très similaire et implique xi*log(lambda[:,t])
     for (size_t t = 0; t < T1 - 1; ++t) {
-        // Laisser cette partie comme une tâche subséquente pour éviter l'erreur de copier/coller.
-        // La complexité est similaire à la boucle t=0.
-    }
+        for (size_t i = 0; i < p; ++i) {
+            size_t t_plus_1 = t + 1;
+            size_t flat_idx = i + t_plus_1 * p;
+            double lambda_i_tplus1 = lambda_1[i][t_plus_1];
+            
+            try {
+                 double B_ii = B[i][i];
+                 if (std::abs(B_ii) < 1e-12) continue;
+                 double var_1 = sigma / B_ii;
+                 if (var_1 <= 0.0) continue;
+                 
+                 // 1. Proposition Log-Normale
+                 // Moyenne Log: moy_1 = np.sum(B[i,:]*(0.5*xi*log(lambda[:,t]) -0.5*log(lambda[:,t+1])))/B[i,i] +log(lambda[i,t+1])
+                 double sum_B_log_lambda_pred = 0.0;
+                 for (size_t k = 0; k < p; ++k) {
+                     // Utilise xi[k] * log(lambda[k,t]) - log(lambda[k,t+1]) pour la somme
+                     sum_B_log_lambda_pred += B[i][k] * (xi[k] * std::log(lambda_1[k][t]) - std::log(lambda_1[k][t + 1]));
+                 }
+                 double moy_1 = sum_B_log_lambda_pred * 0.5 / B_ii + std::log(lambda_i_tplus1); // Note: 0.5 facteur oublié
+                 
+                 std::normal_distribution<double> normal_prop(moy_1, std::sqrt(var_1));
+                 double lambda_star_i = std::exp(normal_prop(generator_prior));
+                 if (lambda_star_i < 0.0001) lambda_star_i = 0.0001;
+
+                 // 2. Calcul du ratio d'acceptation (tp)
+                 double tp = 0.0;
+                 double log_lambda_star_i = std::log(lambda_star_i);
+                 double log_lambda_i_tplus1 = std::log(lambda_i_tplus1);
+                 
+                 // Terme 1: Prior Temporel (t>0)
+                 double sum_B_current = 0.0;
+                 for (size_t k = 0; k < p; ++k) {
+                     sum_B_current += B[i][k] * (-0.5 * xi[k] * std::log(lambda_1[k][t]) + 0.5 * std::log(lambda_1[k][t + 1]));
+                 }
+                 
+                 // Ligne C++ : tp=tp*(0.25*(log(lambda_star[i])-log(lambda_1[i,t+1]))  +np.sum(B[i,:]*(-0.5*xi*log(lambda[:,t]) +0.5*log(lambda[:,t+1])))/B[i,i])
+                 tp += -0.5 * B_ii / sigma;
+                 tp *= (log_lambda_star_i - log_lambda_i_tplus1);
+                 tp *= (0.25 * (log_lambda_star_i - log_lambda_i_tplus1) + sum_B_current / B_ii);
+
+                 // Terme 2: Prior Bêta du Cluster
+                 size_t j = static_cast<size_t>(std::round(SS[flat_idx])); 
+                 if (j >= mu.size()) continue; 
+                 
+                 double diff_j = lambda_star_i - lambda_i_tplus1;
+                 
+                 tp += diff_j * std::log(mu[j]); 
+                 tp += std::lgamma(lambda_star_i + mu_b) - std::lgamma(lambda_i_tplus1 + mu_b);
+                 tp += -std::lgamma(lambda_star_i) + std::lgamma(lambda_i_tplus1);
+
+                 // 3. Décision d'Acceptation
+                 if (tp > logUniformRvs()) {
+                     lambda_1[i][t_plus_1] = lambda_star_i;              
+                 }
+            } catch (const std::exception& e) {
+                std::cerr << "Erreur Full_lambda (t>0, i=" << i << ", t=" << t_plus_1 << "): " << e.what() << ". Rejet." << std::endl;
+            }
+        } // Fin de la boucle i
+    } // Fin de la boucle t
     
     return lambda_1;
 }
 
-
-Matrix fullTheta(const Vector& alpha, double alpha_b,  Vector xi, const Matrix& B, Matrix& theta, double sigma, const Vector& SS, int T1) {
-    size_t p = B.size();
-    if (p == 0) return theta;
-
-    // --- Période t=0 (Initialisation) ---
-    for (size_t i = 0; i < p; ++i) {
-        size_t t = 0;
-        double theta_i0 = theta[i][0];
-        
-        try {
-            double B_ii = B[i][i];
-            if (std::abs(B_ii) < 1e-12) continue;
-
-            double var_2 = sigma / B_ii;
-            if (var_2 <= 0.0) continue;
-            
-            // 1. Proposer theta_star_i par Log-Normale
-            // Log-Normal centrée sur log(theta_i0) avec variance var_2
-            double log_mu_prop = std::log(theta_i0); 
-            std::normal_distribution<double> normal_prop(log_mu_prop, std::sqrt(var_2));
-            
-            double theta_star_i = std::exp(normal_prop(generator_prior));
-            
-            if (theta_star_i < 0.0001) theta_star_i = 0.0001;
-
-            // 2. Calculer le ratio d'acceptation tp (Log-Alpha)
-
-            // Terme 1: Prior Gaussien Temporel (Log-Normal)
-            double log_theta_star_i = std::log(theta_star_i);
-            double log_theta_i0 = std::log(theta_i0);
-
-            // Calcul de Sum(B[i,:] * log(theta[:,0]))
-            double sum_B_log_theta = 0.0;
-            for (size_t k = 0; k < p; ++k) {
-                sum_B_log_theta += B[i][k] * std::log(theta[k][0]);
-            }
-            
-            double tp = -0.5 * B_ii / sigma;
-            tp *= (log_theta_star_i - log_theta_i0);
-            tp *= (-2.0 * sum_B_log_theta / B_ii + log_theta_star_i + log_theta_i0);
-
-            // Terme 2: Prior Bêta du Cluster (impliquant lgamma)
-            size_t j = static_cast<size_t>(std::round(SS[i])); 
-            if (j >= alpha.size()) continue; // Vérification de l'indice du cluster
-            
-            double diff_j = theta_star_i - theta_i0;
-
-            // tp+=diff_j*np.log(alpha[j])
-            tp += diff_j * std::log(alpha[j]); 
-            
-            // Termes Gamma (de la PDF de la Bêta / Priors)
-            // tp+=math.lgamma(theta_star_i+alpha_b)-math.lgamma(theta_i0+alpha_b)
-            tp += std::lgamma(theta_star_i + alpha_b) - std::lgamma(theta_i0 + alpha_b);
-            
-            // tp+=-math.lgamma(theta_star_i)+math.lgamma(theta_i0)
-            tp += -std::lgamma(theta_star_i) + std::lgamma(theta_i0);
-            
-            // 3. Décision d'Acceptation
-            if (tp > logUniformRvs()) {
-                theta[i][0] = theta_star_i;              
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Erreur fullTheta (t=0, i=" << i << "): " << e.what() << ". Rejet." << std::endl;
-        }                                                                             
-    }
-    
-    // --- Périodes t > 0 ---
-    // La logique est très similaire à la boucle fullLambda t>0, utilisant xi*log(theta[:,t])
-    for (size_t t = 0; t < T1 - 1; ++t) {
-        // ... (Implémentation de la boucle t > 0) ...
-        // La logique ici incorpore xi, nécessitant une attention particulière aux indices t et t+1.
-        // Elle est omise pour l'instant, mais suit la même structure MH que t=0.
-    }
-    
-    return theta;
-}
 
 
 Vector fullAlpha(const Matrix& IDH, const Matrix& theta, Vector& alpha, double b_alpha, const Vector& mu, const Vector& SS) {
@@ -227,543 +337,968 @@ Vector fullAlpha(const Matrix& IDH, const Matrix& theta, Vector& alpha, double b
     
     // 3. Mettre à jour et échantillonner alpha_j
     for (int j = 0; j < Ncl; ++j) {
-        double N_j = Cs[j];
-        if (N_j < 1e-9) continue; // Cluster vide, on ignore
-
-        // Paramètres du Prior Gamma de alpha: Gamma(a_alpha, b_alpha)
-        // a_alpha est souvent 1.0 (ou un paramètre fixe du prior)
-        double a_alpha_prior = 1.0; 
+        double theta_j=meanSS(theta,SS,j);
+        double n_j = Cs[j];
+        if (n_j < 1e-9) continue; // Cluster vide, on ignore
+        int it = 0;
+        double alpha_star = 1.0; 
+        double new_shape = 0.25*theta_j+0.25*alpha[j];
         
-        // Paramètres du Postérieur Gamma: Gamma(New_Shape, New_Rate)
-        
-        // Nouvelle Forme (Shape): a_alpha_prior + N_j
-        double new_shape = a_alpha_prior + N_j;
-        
-        // Nouveau Taux (Rate): b_alpha - sum(log(theta_i,t))
-        // Le taux (rate) est l'inverse de l'échelle (scale)
-        // La fonction st.gamma.rvs(a, scale) en Python utilise l'échelle (1/taux)
-        double new_rate = b_alpha - sum_log_theta_j[j];
-
-        if (new_rate <= 0.0) {
-            // Le taux doit être positif. C'est souvent un signe de mauvaise initialisation ou de divergence.
-            std::cerr << "Avertissement fullAlpha: Taux Gamma non positif pour cluster " << j << ". Saut de l'échantillonnage." << std::endl;
-            continue; 
+        // Boucle pour garantir que mu_star est dans (0.001, 0.999)
+        while (it < 10) {
+            std::gamma_distribution<double> gamma_dist(new_shape, b_alpha); // (shape, 1/scale)
+                alpha_star= gamma_dist(generator_prior);
+            
+            it++;
+            if (alpha_star > 0.00001 ) {
+                break;
+            }
         }
-
-        // Échantillonner alpha_j ~ Gamma(New_Shape, 1.0 / New_Rate)
-        std::gamma_distribution<double> gamma_dist(new_shape, 1.0 / new_rate); // (shape, scale)
-        alpha[j] = gamma_dist(generator_prior);
-
-        // Clamper la valeur pour la stabilité
-        if (alpha[j] < 0.0001) alpha[j] = 0.0001; 
+         if (alpha_star <= 0.00001 ) {
+                alpha_star=0.00001 ;
+            }
+        double tp=0;
+        double betaj=alpha[j]*(1-mu[j]);
+        double betaj_star=alpha_star*(-1-mu[j]);
+        double alphaj=alpha[j]*mu[j];
+        double alphaj_star1=alpha_star*mu[j];
+        tp=logLikhoodBetaJ(IDH,alphaj_star1,betaj_star,SS,j)-logLikhoodBetaJ(IDH,alphaj,betaj,SS,j);
+        tp += (0.5*n_j * theta_j - n_j) * (std::log(alpha_star) - std::log(alpha[j]));
+        tp+=b_alpha*(alpha_star-alpha[j])*(1-1/n_j);
+        tp += (0.25*theta_j+0.25*alpha[j]- 1) *( (std::log(alpha_star) - std::log(alpha[j])) +std::log(alpha[j]));
+        // 3. Décision d'Acceptation
+        if (tp > logUniformRvs()) {
+            alpha[j] = alpha_star;
+        }
     }
 
-    // Gérer les cas où le vecteur alpha est trop petit par rapport à Ncl (redimensionnement)
-    if (alpha.size() < Ncl) {
-        alpha.resize(Ncl, 0.0001); 
-    }
 
     return alpha;
 }
 
-Vector fullMu(const Matrix& IDH, const Matrix& lambda_1, Vector& mu, double b_mu, const Vector& alpha, const Vector& SS) {
-    if (lambda_1.empty() || IDH.empty()) return mu;
-    
-    // 1. Calculer les tailles de cluster (Cs) et le nombre de clusters (Ncl)
+Vector fullMu(const Matrix& IDH,
+              const Matrix& lambda_1,
+              Vector& mu,
+              double b_mu,
+              const Vector& alpha,
+              const Vector& SS)
+{
+    // Cas dégénéré
+    if (lambda_1.empty() || IDH.empty()) {
+        return mu;
+    }
+
+    const size_t p   = lambda_1.size();        // nb de lignes (régions)
+    const size_t T1  = lambda_1[0].size();     // nb de périodes
+    const size_t nSS = SS.size();
+
+    // Vérifs dimensionnelles de base
+    for (size_t i = 0; i < p; ++i) {
+        if (lambda_1[i].size() != T1) {
+            throw std::invalid_argument("fullMu: lambda_1 a des lignes de tailles différentes.");
+        }
+    }
+    if (IDH.size() != p || IDH[0].size() != T1) {
+        throw std::invalid_argument("fullMu: dimensions de IDH incompatibles avec lambda_1.");
+    }
+    if (nSS != p * T1) {
+        throw std::invalid_argument("fullMu: SS.size() doit être égal à p * T1.");
+    }
+    if (alpha.size() == 0) {
+        return mu;
+    }
+
+    // 1. Tailles de clusters Cs et nombre de clusters Ncl
     Vector Cs = calculateCs(SS);
-    int Ncl = Cs.size();
+    const size_t Ncl = Cs.size();
 
-    // Redimensionner mu si nécessaire (au cas où le nombre de clusters a changé)
-    if (mu.size() < Ncl) mu.resize(Ncl, 0.5); 
+    if (mu.size() < Ncl) {
+        mu.resize(Ncl, 0.5);  // valeur par défaut si nouveau cluster
+    }
+    if (alpha.size() < Ncl) {
+        throw std::invalid_argument("fullMu: alpha plus court que Cs/mu.");
+    }
 
-    for (int j = 0; j < Ncl; ++j) {
-        double mu_j_current = mu[j];
-        if (Cs[j] < 1.0) continue; // Ignorer les clusters vides
+    // 2. Pré-calcul des moyennes lambda_j pour tous les clusters en une seule passe
+    // lambda_j = moyenne des lambda_1[i,t] tel que SS[i + t*p] == j
+    Vector lambda_mean(Ncl, 0.0);
 
-        // Calculer la moyenne des lambda pour le cluster j (lambda_j)
-        // Note: Cette fonction f.meanSS(lambda_1, SS, j) est censée retourner un SCALAIRE.
-        // Puisque lambda_1 est une Matrix (p x T1), nous avons besoin d'une fonction qui calcule 
-        // la moyenne des lambda_1 pour tous les états (i, t) où SS[i+t*p] == j.
-        
-        // --- PLACEHOLDER pour lambda_j (la moyenne réelle) ---
-        // (Nous supposons qu'une fonction scalaire meanSS existe et retourne la moyenne des éléments)
-        double lambda_j = 0.5; // Doit être calculé par f.meanSS...
-        // Il faudrait utiliser meanSS pour calculer la moyenne des lambda_1[i][t]
-        
-        // --- 1. Proposition mu_star (MH) ---
+    for (size_t t = 0; t < T1; ++t) {
+        const size_t offset = t * p;
+        for (size_t i = 0; i < p; ++i) {
+            const size_t idx = offset + i;
+            int lab = static_cast<int>(SS[idx]);
+            if (lab < 0 || static_cast<size_t>(lab) >= Ncl) {
+                continue; // on ignore les labels invalides
+            }
+            lambda_mean[static_cast<size_t>(lab)] += lambda_1[i][t];
+        }
+    }
+
+    for (size_t j = 0; j < Ncl; ++j) {
+        if (Cs[j] > 0.0) {
+            lambda_mean[j] /= Cs[j];
+        }
+    }
+
+    // 3. Boucle MH sur chaque cluster j
+    for (size_t j = 0; j < Ncl; ++j) {
+        const double n_j = Cs[j];
+        if (n_j < 1.0) {
+            continue; // cluster vide
+        }
+
+        const double mu_j_current = mu[j];
+        const double lambda_j     = lambda_mean[j];
+        const double alpha_j      = alpha[j];
+
+        // --- 3.1. Tirage de la proposition mu_star ~ Beta(a_prop, b_mu) ---
+        const double a_prop = 0.5 * lambda_j + 0.5 * mu_j_current;
+
         double mu_star = 0.0;
         int it = 0;
-        double a_prop = 0.5 * lambda_j + 0.5 * mu_j_current;
-        
-        // Boucle pour garantir que mu_star est dans (0.001, 0.999)
         while (it < 10) {
-            // mu_star = st.beta.rvs((0.5*lambda_j+0.5*mu[j]),b_mu) 
-            // Note: sampleBeta(alpha, beta) donne Beta(alpha, beta)
-            mu_star = sampleBeta(a_prop, b_mu); 
-            it++;
-            if (mu_star >= 0.0001 && mu_star <= 0.9999) {
+            mu_star = sampleBeta(a_prop, b_mu);
+            ++it;
+            if (mu_star >= 1e-5 && mu_star <= 0.99999) {
                 break;
             }
         }
-        if (mu_star < 0.0001) mu_star = 0.0001;
+        if (mu_star < 1e-4)   mu_star = 1e-4;
         if (mu_star > 0.9999) mu_star = 0.9999;
-        
-        // --- 2. Calcul du ratio d'acceptation (Log-Alpha) ---
+
+        // Par sécurité, on s'assure aussi que mu_j_current est dans (0,1)
+        const double mu_cur_clamped = std::min(0.9999, std::max(1e-4, mu_j_current));
+
+        // --- 3.2. Terme de log-vraisemblance Beta sur IDH ---
+        const double beta_j      = alpha_j * (1.0 - mu_cur_clamped);
+        const double beta_j_star = alpha_j * (1.0 - mu_star);
+        const double alpha_j_cur = alpha_j * mu_cur_clamped;
+        const double alpha_j_star= alpha_j * mu_star;
+
         double tp = 0.0;
-        double n_j = Cs[j];
+        tp += logLikhoodBetaJ(IDH, alpha_j_star, beta_j_star, SS, static_cast<int>(j))
+            - logLikhoodBetaJ(IDH, alpha_j_cur, beta_j, SS, static_cast<int>(j));
 
-        // a) Terme de Vraisemblance (LogLikelihood Ratio)
-        // LogLikelihoodBetaJ(IDH, alpha[j], mu_star, SS, j) - LogLikelihoodBetaJ(IDH, alpha[j], mu[j], SS, j)
-        
-        // Note: La fonction logLikhoodBetaJ prend un Vector& ALPHA/BETA. Ici, alpha[j] et mu_star/mu[j] sont des scalaires.
-        // Cela suppose que logLikhoodBetaJ peut gérer des paramètres scalaires.
-        
-        // Pour des raisons de signature, nous devons utiliser une version adaptée ou s'assurer que alpha et mu sont des vecteurs.
-        // Si alpha[j] et mu[j] sont des paramètres de forme, la log-vraisemblance s'écrit :
-        
-        // tp = (LogLik(mu*) - LogLik(mu))
-        // Attention : logLikhoodBetaJ doit être adapté pour prendre le scalaire alpha[j]
-        
-        // (Nous faisons une approximation car la fonction logLikhoodBetaJ originale n'accepte pas un scalaire alpha[j])
-        // tp += LogLik_Mu_Star - LogLik_Mu_Current
+        // --- 3.3. Terme de prior sur mu ---
+        // (n_j*lambda_j - n_j) * (log(mu_star) - log(mu_j))
+        // + (n_j*b_mu - n_j) * (log(1-mu_star) - log(1-mu_j))
+        tp += (n_j * lambda_j - n_j)
+              * (std::log(mu_star) - std::log(mu_cur_clamped));
+        tp += (n_j * b_mu - n_j)
+              * (std::log(1.0 - mu_star) - std::log(1.0 - mu_cur_clamped));
 
-        // b) Terme de Prior
-        // tp+=(n_j*lambda_j-n_j)*(np.log(mu_star)-np.log(mu[j]))+(n_j*b_mu-n_j)*(np.log(1-mu_star)-np.log(1-mu[j]))
-        tp += (n_j * lambda_j - n_j) * (std::log(mu_star) - std::log(mu_j_current));
-        tp += (n_j * b_mu - n_j) * (std::log(1.0 - mu_star) - std::log(1.0 - mu_j_current));
+        // --- 3.4. Terme de proposition (ratio des PDFs Beta) ---
+        // Q(mu -> mu_star): Beta(a_prop, b_mu)
+        // Q(mu_star -> mu): Beta(a_star_prop, b_mu) avec a_star_prop = 0.5*lambda_j + 0.5*mu_star
+        const double a_star_prop = 0.5 * lambda_j + 0.5 * mu_star;
 
-        // c) Terme de Proposition (Ratio des PDF des propositions Bêta)
-        // tp+=-(0.5*lambda_j+0.5*mu[j]-1)*np.log(mu_star)+(0.5*lambda_j+0.5*mu_star-1)*np.log(mu[j])-(b_mu-1)*(np.log(1-mu_star)-np.log(1-mu[j]))
-        
-        double a_star_prop = 0.5 * lambda_j + 0.5 * mu_star;
+        const double log_pdf_mu_prop_star =
+            (a_star_prop - 1.0) * std::log(mu_cur_clamped)
+            + (b_mu      - 1.0) * std::log(1.0 - mu_cur_clamped);
 
-        // Log(PDF(mu | prop_star)) - Log(PDF(mu_star | prop))
-        // Log PDF Beta (x, a, b) = (a-1)log(x) + (b-1)log(1-x) - log(B(a, b))
-        
-        // Terme du logarithme : Log(PDF(mu | prop_star))
-        double log_pdf_mu_prop_star = (a_star_prop - 1.0) * std::log(mu_j_current) + 
-                                     (b_mu - 1.0) * std::log(1.0 - mu_j_current);
-        
-        // Terme du logarithme : Log(PDF(mu_star | prop))
-        double log_pdf_mu_star_prop = (a_prop - 1.0) * std::log(mu_star) + 
-                                      (b_mu - 1.0) * std::log(1.0 - mu_star);
+        const double log_pdf_mu_star_prop =
+            (a_prop - 1.0) * std::log(mu_star)
+            + (b_mu  - 1.0) * std::log(1.0 - mu_star);
 
-        // Terme de transition : Log(Q(mu -> mu*)) - Log(Q(mu* -> mu))
-        tp += log_pdf_mu_prop_star - log_pdf_mu_star_prop; 
+        tp += log_pdf_mu_prop_star - log_pdf_mu_star_prop;
 
-        // 3. Décision d'Acceptation
+        // --- 3.5. Acceptation MH ---
         if (tp > logUniformRvs()) {
             mu[j] = mu_star;
         }
     }
-    return mu;
 
+    return mu;
 }
 
 
-Vector fullXi(Vector& xi, double a_xi, double b_xi, const Matrix& B, const Matrix& lambda_1, double sigma_1) {
-    size_t p = B.size();
-    if (p == 0) return xi;
-    size_t T1 = lambda_1[0].size(); 
-    
-    if (p != B[0].size() || xi.size() != p || sigma_1 <= 0.0) {
-        throw std::invalid_argument("fullXi: Dimensions ou paramètres invalides.");
+Vector fullXi(Vector& xi,
+              double a_xi,
+              double b_xi,
+              const Matrix& B,
+              const Matrix& lambda_1,
+              double sigma_1)
+{
+    const size_t p = B.size();
+    if (p == 0) {
+        return xi;
     }
-    
-    // Initialisation des matrices M1, M2, M
-    // M1 et M2 sont p x p
-    Matrix M1(p, Vector(p, 0.0));
-    Matrix M2(p, Vector(p, 0.0));
-    Matrix M(p, Vector(p, 0.0));
-    
-    // Vérification des bornes de la proposition uniforme
+
+    if (B[0].size() != p) {
+        throw std::invalid_argument("fullXi: B doit être une matrice p x p.");
+    }
+    if (lambda_1.size() != p) {
+        throw std::invalid_argument("fullXi: lambda_1.size() doit être p.");
+    }
+    const size_t T1 = lambda_1[0].size();
+    if (T1 < 1) {
+        return xi;
+    }
+    for (size_t i = 0; i < p; ++i) {
+        if (lambda_1[i].size() != T1) {
+            throw std::invalid_argument("fullXi: toutes les lignes de lambda_1 doivent avoir T1 colonnes.");
+        }
+    }
+    if (xi.size() != p || sigma_1 <= 0.0) {
+        throw std::invalid_argument("fullXi: dimensions ou paramètres invalides.");
+    }
+    if (a_xi >= b_xi) {
+        throw std::invalid_argument("fullXi: intervalle [a_xi, b_xi] invalide.");
+    }
+
+    // On n'a besoin que de M1[i,i] et M2[i,i] après produit par B.
+    // On calcule directement leurs diagonales sans passer par des matrices complètes.
+
+    // Pré-calcul log(lambda_1)
+    Matrix log_lambda(p, Vector(T1));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t t = 0; t < T1; ++t) {
+            const double val = lambda_1[i][t];
+            if (val <= 0.0) {
+                throw std::runtime_error("fullXi: lambda_1[i,t] doit être > 0 pour le log.");
+            }
+            log_lambda[i][t] = std::log(val);
+        }
+    }
+
+    // diagM1[i] = Σ_t Σ_k log_lambda[i][t] * log_lambda[k][t] * B[k][i]
+    // diagM2[i] = Σ_t Σ_k log_lambda[i][t+1] * log_lambda[k][t] * B[k][i]
+    // (sans le /sigma_1 ; on l'appliquera à la fin)
+    Vector diagM1(p, 0.0);
+    Vector diagM2(p, 0.0);
+
+    // Boucle sur t = 0..T1-2
+    for (size_t t = 0; t + 1 < T1; ++t) {
+        // v_k = log_lambda[k][t]
+        // On calcule s_i = Σ_k B[k][i] * v_k (produit matrice-vecteur par colonne)
+        Vector s(p, 0.0);
+        for (size_t k = 0; k < p; ++k) {
+            const double v_k = log_lambda[k][t];
+            if (v_k == 0.0) continue;
+            const Vector& Bk = B[k];
+            for (size_t i = 0; i < p; ++i) {
+                s[i] += Bk[i] * v_k;
+            }
+        }
+
+        for (size_t i = 0; i < p; ++i) {
+            const double log_t_i  = log_lambda[i][t];
+            const double log_tp1_i = log_lambda[i][t + 1];
+            const double s_i      = s[i];
+
+            diagM1[i] += log_t_i  * s_i;    // correspond à M1[i,i] * sigma_1
+            diagM2[i] += log_tp1_i * s_i;   // correspond à M2[i,i] * sigma_1
+        }
+    }
+
+    // On a maintenant (sans facteur 1/sigma_1) :
+    //   M1[i,i] = diagM1[i] / sigma_1
+    //   M2[i,i] = diagM2[i] / sigma_1
+    // Et dans ton code original :
+    //   tp_final = [ (xi^2 - xi_star^2)*M1[i,i] - 2*(xi - xi_star)*M2[i,i] ] / (2*sigma_1)
+    // Donc au total : facteur 1 / (2 * sigma_1^2)
+    const double inv_sigma1   = 1.0 / sigma_1;
+    const double half_inv_sig_sq = 0.5 * inv_sigma1 * inv_sigma1;
+
+    // Propositions uniformes
     std::uniform_real_distribution<double> uniform_prop(a_xi, b_xi);
 
-    // --- 1. Calcul des Statistiques Suffisantes M1 et M2 (Somme sur t) ---
-    for (size_t t = 0; t < T1 - 1; ++t) {
-        
-        // a) Calculer log(lambda_1[:,t]) et XXt(log(lambda_1[:,t])) pour M1
-        Vector log_lambda_t(p);
-        for (size_t k = 0; k < p; ++k) {
-            if (lambda_1[k][t] <= 0.0) {
-                throw std::runtime_error("fullXi: Lambda non positif pour le log.");
-            }
-            log_lambda_t[k] = std::log(lambda_1[k][t]);
-        }
-        
-        Matrix XXt_t = XXt(log_lambda_t);
-        
-        // M1 += XXt(...) / sigma_1
-        for (size_t r = 0; r < p; ++r) {
-            for (size_t c = 0; c < p; ++c) {
-                M1[r][c] += XXt_t[r][c] / sigma_1;
-            }
-        }
-        
-        // b) Calculer M (pour M2) : M[i,:] = log(lambda_1[i,t+1]) * log(lambda_1[:,t]) / sigma_1
-        for (size_t r = 0; r < p; ++r) { // Ligne r (i)
-            double log_lambda_t_plus_1 = std::log(lambda_1[r][t + 1]);
-            for (size_t c = 0; c < p; ++c) { // Colonne c
-                // M[r][c] = log(lambda_1[r, t+1]) * log(lambda_1[c, t]) / sigma_1
-                M[r][c] = log_lambda_t_plus_1 * log_lambda_t[c] / sigma_1;
-            }
-        }
-        
-        // M2 = M2 + M
-        for (size_t r = 0; r < p; ++r) {
-            for (size_t c = 0; c < p; ++c) {
-                M2[r][c] += M[r][c];
-            }
-        }
-    }
-    
-    // 2. Produit Matriciel Final : M1 = M1 @ B et M2 = M2 @ B
-    M1 = multiplyMatrices(M1, B);
-    M2 = multiplyMatrices(M2, B);
-    
-    // --- 3. Étape Metropolis-Hastings (pour chaque xi_i) ---
+    // --- 3. Metropolis-Hastings pour chaque xi_i ---
     for (size_t i = 0; i < p; ++i) {
-        double xi_i_current = xi[i];
-        
-        // Proposer xi_i_star ~ Uniforme(a_xi, b_xi)
-        double xi_i_star = uniform_prop(generator_prior);
-        
-        // Calculer Log-Alpha (tp) : Terme de Prior Gaussien Temporel
-        // tp = (xi[i]**2-xi_i_star**2)*M1[i,i] - 2*(xi[i]-xi_i_star)*M2[i,i]
-        
-        double tp_numerateur = (std::pow(xi_i_current, 2.0) - std::pow(xi_i_star, 2.0)) * M1[i][i];
-        double tp_denominateur = -2.0 * (xi_i_current - xi_i_star) * M2[i][i];
-        
-        double tp_somme = tp_numerateur + tp_denominateur;
-        
-        // tp=tp/2 / sigma_1
-        double tp_final = tp_somme / (2.0 * sigma_1);
-        
-        // Décision d'Acceptation (Note: Le ratio de proposition uniforme s'annule)
-        if (tp_final > logUniformRvs()) {
+        const double xi_i_current = xi[i];
+        const double xi_i_star    = uniform_prop(generator_prior);
+
+        const double xi_curr_sq = xi_i_current * xi_i_current;
+        const double xi_star_sq = xi_i_star    * xi_i_star;
+
+        const double d1 = (xi_curr_sq - xi_star_sq) * diagM1[i];
+        const double d2 = -2.0 * (xi_i_current - xi_i_star) * diagM2[i];
+
+        const double log_alpha = (d1 + d2) * half_inv_sig_sq;
+
+        if (log_alpha > logUniformRvs()) {
             xi[i] = xi_i_star;
         }
     }
-    
-    return xi;
 
+    return xi;
 }
 
-
-double fullSigma(double a_sigma, double b_sigma, double sigma, const Matrix& lambda_1, int T1, int p, const Matrix& B, Vector xi){
+double fullSigma(double a_sigma,
+                 double b_sigma,
+                 double sigma,
+                 const Matrix& lambda_1,
+                 int T1,
+                 int p,
+                 const Matrix& B,
+                 const Vector& xi)   // ← idéalement const&, pour éviter une copie
+{
+    // Cas dégénérés : on ne touche pas à sigma
     if (p == 0) return sigma;
     if (lambda_1.empty() || lambda_1[0].empty()) return sigma;
-    // Vérifications de dimension
-    if (xi.size() != p || B[0].size() != (size_t)p) {
-        throw std::invalid_argument("euclideanDistanceSq: Dimensions de B ou xi incohérentes avec p.");
+
+    // Vérifications de dimensions
+    if (lambda_1.size() != static_cast<std::size_t>(p)) {
+        throw std::invalid_argument("fullSigma: lambda_1.size() != p.");
+    }
+    if (lambda_1[0].size() < static_cast<std::size_t>(T1)) {
+        throw std::invalid_argument("fullSigma: lambda_1[0].size() < T1.");
+    }
+    if (B.size() != static_cast<std::size_t>(p) ||
+        B[0].size() != static_cast<std::size_t>(p)) {
+        throw std::invalid_argument("fullSigma: B n'est pas une matrice p x p.");
+    }
+    if (xi.size() != static_cast<std::size_t>(p)) {
+        throw std::invalid_argument("fullSigma: xi.size() != p.");
     }
 
-    // Le nombre de termes à sommer est p * (T1 - 1)
-    double N_eff = (double)p * (T1 - 1);
+    // Nombre de termes temporels (t = 0..T1-2)
+    const double N_eff = static_cast<double>(p) * static_cast<double>(T1 - 1);
     
-    // --- 1. Calcul de la Somme des Carrés des Résidus (Somme sur t, i) ---
-    double RSS = 0.0; // Residual Sum of Squares (somme de la log-vraisemblance)
+    // --- 1. Calcul de la somme des carrés des résidus : RSS = Σ_t r_t^T B r_t ---
+    double RSS = 0.0;
 
-    for (size_t t = 0; t < (size_t) T1 - 1; ++t) {
-        // Matrice L(t+1) (log-lambda à t+1)
-        Vector log_lambda_t_plus_1(p);
-        // Matrice L(t) (log-lambda à t)
-        Vector log_lambda_t(p);
+    // vecteur résidu réutilisé pour chaque t
+    Vector residu(p, 0.0);
 
-        for (size_t i = 0; i < (size_t)p; ++i) {
-            log_lambda_t_plus_1[i] = std::log(lambda_1[i][t + 1]);
-            log_lambda_t[i] = std::log(lambda_1[i][t]);
+    // Boucle sur le temps
+    for (int t = 0; t < T1 - 1; ++t) {
+        const int t1 = t + 1;
+
+        // Construire r_i = log λ_{i, t+1} − xi_i * log λ_{i, t}
+        for (int i = 0; i < p; ++i) {
+            const double log_lambda_t1 = std::log(lambda_1[i][t1]);
+            const double log_lambda_t  = std::log(lambda_1[i][t]);
+            residu[i] = log_lambda_t1 - xi[i] * log_lambda_t;
         }
 
-        // Calcul du terme de résidu pour chaque i : log(lambda[i, t+1]) - xi[i] * log(lambda[i, t])
-        Vector residu_temporel(p);
-        for (size_t i = 0; i < p; ++i) {
-            residu_temporel[i] = log_lambda_t_plus_1[i] - xi[i] * log_lambda_t[i];
+        // Calculer r^T B r sans matrices intermédiaires
+        double quad = 0.0;
+        for (int i = 0; i < p; ++i) {
+            const Vector& Bi = B[i];
+            double Bi_dot_r = 0.0;
+            for (int j = 0; j < p; ++j) {
+                Bi_dot_r += Bi[j] * residu[j];
+            }
+            quad += residu[i] * Bi_dot_r;
         }
 
-        // Calcul de trace(B * residu * residu^T)
-        // RSS += trace(B * residu * residu^T)
-
-        // a) Calculer residu * residu^T
-        Matrix residu_residu_T = XXt(residu_temporel); 
-
-        // b) Calculer B * (residu * residu^T)
-        // (Nous supposons l'existence d'une fonction de multiplication matricielle multiplyMatrices)
-        Matrix B_times_residu = multiplyMatrices(B, residu_residu_T);
-
-        // c) Sommer la trace
-        RSS += trace(B_times_residu); 
+        RSS += quad;
     }
     
-    // --- 2. Paramètres du Postérieur Gamma (pour le taux de précision tau = 1/sigma) ---
-    // Si prior: tau ~ Gamma(a_sigma, b_sigma)
-    // Postérieur: tau | ... ~ Gamma(New_Shape, New_Rate)
-    
-    // Nouvelle Forme (Shape): a_sigma + N_eff / 2
-    double new_shape = a_sigma + N_eff / 2.0;
+    // --- 2. Paramètres du postérieur Gamma sur tau = 1/sigma ---
+    const double new_shape = a_sigma + N_eff / 2.0;
+    const double new_rate  = b_sigma + RSS   / 2.0;
 
-    // Nouveau Taux (Rate): b_sigma + RSS / 2
-    // Le taux (rate) est le paramètre d'échelle *inverse* dans le C++ std::gamma_distribution
-    double new_rate = b_sigma + RSS / 2.0;
+    // --- 3. Échantillon de tau ---
+    // std::gamma_distribution(shape, scale) avec scale = 1/rate
+    std::gamma_distribution<double> gamma_dist(new_shape, 1.0 / new_rate);
+    const double tau_star = gamma_dist(generator_prior);
 
-    // --- 3. Échantillonnage de tau (tau = 1/sigma) ---
-    // Échantillonner tau ~ Gamma(New_Shape, 1.0 / New_Rate)
-    // std::gamma_distribution utilise (shape, scale) où scale = 1/rate
-    std::gamma_distribution<double> gamma_dist(new_shape, 1.0 / new_rate); 
-    
-    double tau_star = gamma_dist(generator_prior);
-
-    // --- 4. Calcul de la nouvelle valeur de sigma ---
     if (tau_star < 1e-12) {
-        return 1.0; // Éviter la division par zéro (retourner une valeur stable)
+        // sécurité numérique
+        return 1.0;
     }
 
-    double sigma_star = 1.0 / tau_star;
-    
+    const double sigma_star = 1.0 / tau_star;
     return sigma_star;
 }
 
 
-double logLikelihoodExisting(size_t i, size_t t, size_t j, const Vector& alpha, const Vector& mu, const Matrix& lambda_1, const Matrix& theta) 
-    {
-    // Dans votre modèle Bêta, cette valeur est proportionnelle à :
-    // log(Beta(lambda_i,t | alpha_j, mu_j)) + log(Beta(theta_i,t | alpha_j, mu_j))
-    
-    // Pour l'instant, nous retournons une valeur simple basée sur la distance à la moyenne du cluster j (TRÈS SIMPLIFIÉ)
-    double log_prob = -10.0; 
-    
-    // Le code C++ nécessitera la traduction des fonctions logLikhoodBetaJ ou logLikhood
-    return log_prob; 
+
+
+
+// Fonctions utilitaires de manipulation de vecteurs
+void delete_last_element(Vector& vec) {
+    if (!vec.empty()) {
+        vec.pop_back();
+    }
 }
 
 
 /**
- * PLACEHOLDER: Calcule le Log-Likelihood de l'état (i,t) pour un NOUVEAU cluster.
- * Cette probabilité est l'intégrale de la vraisemblance sur le prior base measure.
- * (C'est le terme L(data_i | Base Measure) qui est complexe à calculer).
+ * Traduction de Full_partition (Neal's Algorithm 8 pour DPMM Beta-Gaussian)
  */
-double logLikelihoodNew(size_t i, size_t t, double b_mu, double b_alpha, const Matrix& lambda_1, const Matrix& theta) {
-    // Cette valeur est le Log-Likelihood intégré sous le prior H(alpha, mu).
-    // Elle dépend des intégrales complexes du modèle Beta-Beta-Beta.
-    
-    // Pour l'instant, nous retournons une valeur simple
-    return -15.0; 
-}
 
 
-// --------------------------------------------------------------------------
 
-PriorPartitionResult fullPartition(double b, double M, Vector& SS, Vector& CS, const Matrix& IDH, Vector& mu, double b_mu, Vector& alpha, double b_alpha, const Matrix& lambda_1, const Matrix& theta, const Matrix& X, int m_neal) {
-    
-    size_t p = IDH.size(); 
-    size_t T1 = IDH[0].size(); 
-    size_t N = p * T1; // Nombre total d'états à clusteriser
-
-    if (SS.size() != N) {
-        throw std::invalid_argument("fullPartition: La taille de SS ne correspond pas aux données.");
+PriorPartitionResult fullPartition(
+    double b, double M, Vector& SS_in, Vector& CS_in, const Matrix& IDH, 
+    Vector& mu_in, double b_mu, Vector& alpha_in, double b_alpha, 
+    const Matrix& lambda_1, const Matrix& theta, const Matrix& X, int m_neal) 
+{
+    constexpr bool verbose = false;
+    if (verbose) {
+        std::cout << "~~~~~~~~~~~~~~~~~~~debut partitionnement~~~~~~~~~~~~~~~~~~~~" << std::endl;
     }
-    
-    // La boucle de Neal's Algorithm s'exécute m_neal fois.
-    for (int iter_neal = 0; iter_neal < m_neal; ++iter_neal) {
-        
-        // Itérer sur tous les N états (i, t)
-        for (size_t i_flat = 0; i_flat < N; ++i_flat) {
-            
-            size_t t = i_flat / p; // Période t
-            size_t i = i_flat % p; // Région i
-            
-            // 1. Retirer l'état (i, t) de son cluster actuel (j_old)
-            int j_old = static_cast<int>(std::round(SS[i_flat]));
-            
-            if (j_old >= CS.size() || j_old < 0) continue; // Erreur d'indice
-            
-            // Décrémenter la taille de l'ancien cluster
-            CS[j_old] -= 1.0; 
-            
-            // 2. Gestion des Clusters Vides
-            // Si le cluster j_old devient vide (CS[j_old] == 0)
-            bool cluster_was_deleted = false;
-            if (CS[j_old] < 1e-9) { 
-                // Supprimer ce cluster des paramètres globaux (alpha et mu)
-                if (j_old < mu.size()) {
-                    mu.erase(mu.begin() + j_old);
-                    alpha.erase(alpha.begin() + j_old);
-                    CS.erase(CS.begin() + j_old);
-                    cluster_was_deleted = true;
-                }
-                
-                // Mettre à jour tous les labels SS > j_old
-                for (size_t k = 0; k < N; ++k) {
-                    if (static_cast<int>(std::round(SS[k])) > j_old) {
-                        SS[k] -= 1.0; // Décaler les labels
-                    }
-                }
-            }
-            
-            // 3. Calculer les probabilités de réaffectation
-            size_t Ncl_current = CS.size(); 
-            Vector log_probs(Ncl_current + 1); // Ncl_current + 1 pour le nouveau cluster
-            double N_minus_1 = N - 1.0; 
-            
-            // a) Probabilités des clusters existants (j < Ncl_current)
-            for (size_t j = 0; j < Ncl_current; ++j) {
-                // Terme CRP: log(n_j / (N - 1 + M))
-                double log_CRP = std::log(CS[j]) - std::log(N_minus_1 + M);
-                
-                // Terme Vraisemblance: log(L(data_i | cluster j))
-                double log_L = logLikelihoodExisting(i, t, j, alpha, mu, lambda_1, theta);
-                
-                log_probs[j] = log_CRP + log_L;
-            }
-            
-            // b) Probabilité d'un nouveau cluster (j = Ncl_current)
-            // Terme CRP: log(M / (N - 1 + M))
-            double log_CRP_new = std::log(M) - std::log(N_minus_1 + M);
-            
-            // Terme Vraisemblance: log(L(data_i | Base Measure))
-            double log_L_new = logLikelihoodNew(i, t, b_mu, b_alpha, lambda_1, theta);
-            
-            log_probs[Ncl_current] = log_CRP_new + log_L_new;
 
-            // 4. Normalisation et Échantillonnage
-            double max_log_prob = log_probs[0];
-            for (double lp : log_probs) {
-                if (lp > max_log_prob) max_log_prob = lp;
+    // --- 0. Vérifications de base sur les dimensions ---
+    const std::size_t p   = IDH.size();
+    if (p == 0) {
+        throw std::invalid_argument("fullPartition: IDH vide (p=0).");
+    }
+    const std::size_t T1  = IDH[0].size();
+    if (T1 == 0) {
+        throw std::invalid_argument("fullPartition: IDH a 0 colonnes (T1=0).");
+    }
+    const std::size_t p_T1 = p * T1;
+
+    // Vérifier la cohérence de IDH, lambda_1, theta en (p x T1)
+    auto check_matrix_shape = [p, T1](const Matrix& M, const char* name) {
+        if (M.size() != p) {
+            throw std::invalid_argument(std::string(name) + ": nombre de lignes != p.");
+        }
+        for (std::size_t i = 0; i < p; ++i) {
+            if (M[i].size() != T1) {
+                throw std::invalid_argument(
+                    std::string(name) + ": nombre de colonnes != T1 à la ligne " + std::to_string(i)
+                );
+            }
+        }
+    };
+
+    check_matrix_shape(IDH,      "IDH");
+    check_matrix_shape(lambda_1, "lambda_1");
+    check_matrix_shape(theta,    "theta");
+    //check_matrix_shape(X,        "X");
+
+    // Dimension l = nombre de colonnes de X
+    const int l = static_cast<int>(X[0].size());
+    if (l <= 0) {
+        throw std::invalid_argument("fullPartition: l <= 0 (nb de colonnes de X).");
+    }
+
+    // Hyper-param (tel quel)
+    double b_j = b;
+
+    // Valeur minimale pour m_neal
+    if (m_neal <= 0) m_neal = 3;
+
+    // Alias pour les vecteurs passés par référence
+    Vector& SS    = SS_in;   // labels de taille p*T1
+    Vector& CS    = CS_in;   // tailles de clusters
+    Vector& mu    = mu_in;
+    Vector& alpha = alpha_in;
+
+    // Vérifier SS a bien p*T1 éléments
+    if (SS.size() != p_T1) {
+        throw std::invalid_argument("fullPartition: SS.size() != p*T1.");
+    }
+
+    // Vérifier cohérence entre CS, mu, alpha
+    if (!(CS.size() == mu.size() && mu.size() == alpha.size())) {
+        throw std::invalid_argument("fullPartition: tailles incohérentes entre CS, mu, alpha.");
+    }
+
+    // Nombre de clusters actuel
+    int Ncl = static_cast<int>(CS.size());
+
+    // --- Buffers réutilisables pour éviter des allocations dans la boucle ---
+    Vector prob;          // log-probabilités
+    Vector CS1;           // tailles de clusters étendues (existant + m_neal)
+    Vector norm_prob;     // probabilités normalisées
+    Vector mu_tp(m_neal);     // mu pour nouveaux clusters
+    Vector alpha_tp(m_neal);  // alpha pour nouveaux clusters
+
+    // --- Boucle sur tous les points (i, t) ---
+    for (std::size_t t = 0; t < T1; ++t) {
+        for (std::size_t i = 0; i < p; ++i) {
+
+            const std::size_t flat_index = i + t * p;  // index 0..p*T1-1
+            int k0 = static_cast<int>(std::round(SS[flat_index])); // cluster actuel
+
+            // Sanity check: k0 peut être hors [0, Ncl-1] si SS est corrompu
+            if (k0 < 0 || k0 >= Ncl) {
+                std::cerr << "Warning fullPartition: label k0=" << k0
+                          << " hors [0," << (Ncl-1) << "], on saute ce point.\n";
+                continue;
             }
 
-            Vector probs(Ncl_current + 1);
-            double sum_probs = 0.0;
+            int k_star = 0; // indicateur de groupe perdu
 
-            for (size_t k = 0; k < Ncl_current + 1; ++k) {
-                // Utiliser la soustraction du maximum pour éviter le débordement numérique
-                probs[k] = std::exp(log_probs[k] - max_log_prob); 
-                sum_probs += probs[k];
-            }
-            
-            // Normalisation des probabilités (p(k) = exp(log_p(k))/sum(exp(log_p(l))))
-            for (size_t k = 0; k < Ncl_current + 1; ++k) {
-                probs[k] /= sum_probs;
-            }
-            
-            // Échantillonnage de j_new à partir de probs
-            std::discrete_distribution<> dist(probs.begin(), probs.end());
-            int j_new = dist(generator_prior);
-            
-            // 5. Réassigner l'état (i, t)
-            
-            if (j_new < Ncl_current) {
-                // a) Cluster existant
-                SS[i_flat] = static_cast<double>(j_new);
-                CS[j_new] += 1.0;
+            // --- 1. Retrait de l'élément (i, t) du cluster k0 ---
+            if (k0 < static_cast<int>(CS.size()) && CS[k0] > 1.0) {
+                // On décrémente simplement la taille
+                CS[k0] -= 1.0;
             } else {
-                // b) Nouveau cluster
-                SS[i_flat] = static_cast<double>(Ncl_current); // Le nouveau label est Ncl_current
-                
-                // Ajouter le nouveau cluster aux paramètres globaux
-                CS.push_back(1.0);
-                
-                // Échantillonner de nouveaux paramètres (alpha_new, mu_new) à partir du Prior Base Measure (H)
-                // PLACEHOLDER: Tirer alpha et mu du prior (Gamma(a_alpha, b_alpha) ou Bêta(a_beta, b_beta))
-                mu.push_back(sampleBeta(1.0, b_mu));      // Exemple de tirage Bêta (doit être adapté)
-                alpha.push_back(1.0); // Exemple de tirage Gamma (doit être adapté)
+                // Cluster k0 est détruit
+                int kminus = Ncl - 1;    // dernier cluster (index Ncl-1)
+                Ncl -= 1;                // nouveau nombre de clusters = ancien - 1
+
+                if (k0 < Ncl) {
+                    // On permute le label kminus -> k0
+                    for (std::size_t l_idx = 0; l_idx < p_T1; ++l_idx) {
+                        int lab = static_cast<int>(std::round(SS[l_idx]));
+                        if (lab == kminus) {
+                            SS[l_idx] = static_cast<double>(k0);
+                        }
+                    }
+                    k_star = 1;
+                    SS[flat_index] = static_cast<double>(kminus);
+
+                    // Permutation des paramètres
+                    mu[k0]    = mu[kminus];
+                    alpha[k0] = alpha[kminus];
+                    CS[k0]    = CS[kminus];
+                }
+
+                // On supprime le dernier élément (kminus) de CS, mu, alpha
+                if (!CS.empty())    CS.pop_back();
+                if (!mu.empty())    mu.pop_back();
+                if (!alpha.empty()) alpha.pop_back();
+
+                Ncl = static_cast<int>(CS.size());
             }
-        } // Fin de la boucle i_flat
-    } // Fin de la boucle Neal
-    // 6. Préparer le résultat final
+
+            // On marque l'élément comme retiré
+            SS[flat_index] = -1.0;
+
+            // --- 2. Calcul des probabilités de proposition ---
+            const int kminus_current = Ncl;
+            const int h_neal         = kminus_current + m_neal;
+
+            if (kminus_current < 0 || h_neal <= 0) {
+                throw std::runtime_error("fullPartition: h_neal ou Ncl invalides.");
+            }
+
+            // Redimensionner / réinitialiser les buffers
+            prob.assign(h_neal, 0.0);
+            CS1.assign(h_neal, -1.0);
+            norm_prob.assign(h_neal, 0.0);
+
+            // Copier CS dans CS1[0..Ncl-1]
+            for (int r = 0; r < kminus_current; ++r) {
+                CS1[r] = CS[r];
+            }
+
+            // a) Clusters existants (j = 0 .. Ncl-1)
+            for (int j = 0; j < kminus_current; ++j) {
+                // Cas "avec le point"
+                SS[flat_index] = static_cast<double>(j);
+                CS1[j] = CS[j] + 1.0;
+
+                double g_xjStar = numerateur(CS1, j, b, l)
+                                  - denominateur(SS, X, j, CS1, l, b);
+
+                // Log-likelihood IDH
+                const double bj = alpha[j] * (1.0 - mu[j]);
+                const double aj = alpha[j] * mu[j];
+                const double log_lik_IDH = logBetaPDF(IDH[i][t], aj, bj);
+
+                // Cas "sans le point"
+                SS[flat_index] = -1.0;
+                CS1[j] = CS[j];
+
+                double g_xj = numerateur(CS1, j, b, l)
+                              - denominateur(SS, X, j, CS1, l, b);
+
+                // Log-proba
+                prob[j] = (g_xjStar - g_xj)
+                          + log_lik_IDH
+                          + std::log(CS[j])
+                          + std::log(M);
+            }
+
+            // b) Nouveaux clusters (j = 0 .. m_neal-1)
+            for (int j = 0; j < m_neal; ++j) {
+
+                const int j_new = kminus_current + j;   // index dans prob/CS1
+
+                // Tirage des paramètres du nouveau cluster
+                mu_tp[j] = sampleBeta(lambda_1[i][t], b_mu);
+                if (mu_tp[j] < 0.001) mu_tp[j] = 0.001;
+                if (mu_tp[j] > 0.999) mu_tp[j] = 0.999;
+
+                alpha_tp[j] = sampleGamma(0.5 * theta[i][t], b_alpha);
+                if (alpha_tp[j] < 0.001) alpha_tp[j] = 0.001;
+
+                // Affectation temporaire
+                SS[flat_index] = static_cast<double>(j_new);
+                CS1[j_new]     = 1.0;
+
+                // Cohésion (on garde la même dépendance à b_j qu'avant)
+                double g_xjStar = numerateur(CS1, j_new, b_j, l)
+                                  - denominateur(SS, X, j_new, CS1, l, b_j);
+
+                // Log-likelihood
+                double bj_new = alpha_tp[j] * (1.0 - mu_tp[j]);
+                double aj_new = alpha_tp[j] * mu_tp[j];
+                double log_lik_new = logBetaPDF(IDH[i][t], aj_new, bj_new);
+
+                prob[j_new] = log_lik_new
+                              + g_xjStar
+                              + std::log(M / static_cast<double>(m_neal));
+
+                // reset
+                SS[flat_index] = -1.0;
+                CS1[j_new]     = -1.0;
+            }
+
+            // étiquette temporaire (comme dans ton code)
+            SS[flat_index] = static_cast<double>(kminus_current);
+
+            // --- 3. Normalisation & échantillonnage discret (log-sum-exp) ---
+            double max_log_prob = prob[0];
+            for (int k = 1; k < h_neal; ++k) {
+                if (prob[k] > max_log_prob) max_log_prob = prob[k];
+            }
+
+            double sum_exp = 0.0;
+            for (int k = 0; k < h_neal; ++k) {
+                norm_prob[k] = std::exp(prob[k] - max_log_prob);
+                sum_exp += norm_prob[k];
+            }
+
+            if (sum_exp <= 0.0 || !std::isfinite(sum_exp)) {
+                std::cerr << "Warning fullPartition: sum_exp invalide, on passe à uniforme.\n";
+                const double inv = 1.0 / static_cast<double>(h_neal);
+                for (int k = 0; k < h_neal; ++k) {
+                    norm_prob[k] = inv;
+                }
+            } else {
+                const double inv_sum = 1.0 / sum_exp;
+                for (int k = 0; k < h_neal; ++k) {
+                    norm_prob[k] *= inv_sum;
+                }
+            }
+
+            int Ng = sampleDiscrete(norm_prob);  // doit retourner un int dans [0, h_neal-1]
+
+            if (Ng < 0 || Ng >= h_neal) {
+                std::cerr << "Warning fullPartition: Ng=" << Ng
+                          << " hors [0," << (h_neal-1) << "], on skip.\n";
+                continue;
+            }
+
+            // --- 4. Affectation finale ---
+            SS[flat_index] = static_cast<double>(Ng);
+
+            if (Ng < kminus_current) {
+                // cluster existant
+                CS[Ng] += 1.0;
+            } else {
+                // nouveau cluster
+                int j_aux = Ng - kminus_current;  // 0..m_neal-1
+
+                // Dans ton code, tu mets SS[flat_index] = kminus_current ici.
+                // On garde ce comportement pour rester cohérent.
+                SS[flat_index] = static_cast<double>(kminus_current);
+
+                // Ajout des paramètres du nouveau cluster
+                mu.push_back(mu_tp[j_aux]);
+                alpha.push_back(alpha_tp[j_aux]);
+                CS.push_back(1.0);
+
+                Ncl = static_cast<int>(CS.size());
+            }
+
+        } // i
+    } // t
+
+    if (verbose) {
+        std::cout << "~~~~~~~~~~~~~~~~~~~~~~~~~FIN PARTITIONNMENT~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << std::endl;
+    }
+
+    // Recalcul des tailles de clusters à partir de SS
+    CS = calculateCs(SS);
+    Ncl = static_cast<int>(CS.size());
+
     PriorPartitionResult result;
-    result.Ncl = CS.size();
-    result.SS = SS;
-    result.CS_r = CS;
-    result.mu_r = mu;
+    result.Ncl     = Ncl;
+    result.CS_r    = CS;
+    result.SS      = SS;
+    result.mu_r    = mu;
     result.alpha_r = alpha;
+
     return result;
 }
 
-/*Vector fullBetaPoll(const Vector& r, const Vector& e, const Matrix& X, Vector& beta, const Vector& sigma_beta, const Vector& psi, const Vector& y, const Vector& SS, int T1) {
-    size_t l = beta.size(); // Nombre de coefficients
-    if (l == 0) return beta;
+/*PriorPartitionResult fullPartition(
+    double b, double M, Vector& SS_in, Vector& CS_in, const Matrix& IDH, 
+    Vector& mu_in, double b_mu, Vector& alpha_in, double b_alpha, 
+    const Matrix& lambda_1, const Matrix& theta, const Matrix& X, int m_neal) 
+{
+    std::cout << "~~~~~~~~~~~~~~~~~~~debut partitionnement~~~~~~~~~~~~~~~~~~~~" << std::endl;
 
-    // Détermination de p (nombre de régions)
-    size_t dT = X.size(); // Nombre total de lignes (p * T1)
-    if (T1 <= 0) return beta;
-    size_t p = (size_t)std::round((double)dT / (double)T1); // p = dT / T1 (nombre de régions)
-    
-    if (sigma_beta.size() != l) {
-        throw std::invalid_argument("full_beta_poll: sigma_beta doit avoir la même taille que beta.");
+    // --- 0. Vérifications de base sur les dimensions ---
+    const std::size_t p   = IDH.size();
+    if (p == 0) {
+        throw std::invalid_argument("fullPartition: IDH vide (p=0).");
     }
-    
-    // Matrice de covariables (X) doit être de taille p*T1 x l
-    // X[k+t*p, :] en Python -> X[k_flat] en C++
+    const std::size_t T1  = IDH[0].size();
+    if (T1 == 0) {
+        throw std::invalid_argument("fullPartition: IDH a 0 colonnes (T1=0).");
+    }
+    const std::size_t p_T1 = p * T1;
 
-    // Distribution Normale pour la proposition MH (centrée sur beta[i])
-    std::normal_distribution<double> normal_proposal(0.0, 1.0); 
-
-    // Boucle sur chaque coefficient beta[i]
-    for (size_t i = 0; i < l; ++i) { 
-        
-        // Copie des vecteurs pour la proposition
-        Vector beta_star = beta;
-        double beta_i_current = beta[i];
-        double sigma_i = sigma_beta[i];
-
-        // 1. Proposer beta_star[i] (Normal centré sur beta[i] avec écart-type sigma_beta[i])
-        beta_star[i] = beta_i_current + normal_proposal(generator_prior) * sigma_i;
-        
-        // --- 2. Calcul du ratio d'acceptation (Log-Alpha) ---
-        double tp = 0.0; 
-
-        // a) Terme de Prior (Ratio Gaussien sur beta[i] ~ N(0, sigma_beta[i]^2))
-        // tp = -(np.power(beta_star[i],2)-np.power(beta1[i],2))/(2*sigma_beta[i])
-        tp += -(std::pow(beta_star[i], 2.0) - std::pow(beta_i_current, 2.0)) / (2.0 * sigma_i * sigma_i);
-
-        // b) Terme de Vraisemblance (Somme sur tous les points p*T1)
-        for (size_t k_flat = 0; k_flat < dT; ++k_flat) { // k_flat est l'indice aplati
-            
-            size_t k = k_flat % p; // Indice de la région (k)
-            size_t t = k_flat / p; // Indice du temps (t)
-            
-            size_t j00 = static_cast<size_t>(std::round(SS[k_flat])); // Cluster du point k_flat
-            
-            // X_row est X[k_flat, :]
-            const Vector& X_row = X[k_flat]; 
-
-            // Calculer le prédicteur linéaire pour beta_star et beta_current
-            double eta_star = dot_product_vector(X_row, beta_star) + psi[j00];
-            double eta_current = dot_product_vector(X_row, beta) + psi[j00];
-            
-            // Calculer mu (taux d'arrivée de Poisson)
-            double mu_star = std::exp(eta_star);
-            double mu_current = std::exp(eta_current);
-
-            // Paramètres r et y
-            double r_j = r[j00];
-            double e_k = e[k_flat];
-            double y_k = y[k_flat];
-            
-            // --- Terme A (du log(r + e*mu)) ---
-            // tp1 = np.log(r + e*mu*) - np.log(r + e*mu)
-            double log_ratio_r_e_mu = std::log(r_j + e_k * mu_star) - std::log(r_j + e_k * mu_current);
-            
-            // tp1 = -tp1 * (r[j00]+y[k+t*p])
-            double tp1_A = -log_ratio_r_e_mu * (r_j + y_k);
-            tp += tp1_A;
-
-            // --- Terme B (du y * X*beta) ---
-            // tp1=y[k+t*p]*(np.sum(X[k+t*p,:]*(beta_star-beta1)))
-            // Note: np.sum(X[k+t*p,:]*(beta_star-beta1)) est (X_row * beta_star) - (X_row * beta1) = eta_star - eta_current
-            double tp1_B = y_k * (eta_star - eta_current); 
-            tp += tp1_B;
+    // Vérifier la cohérence de IDH, lambda_1, theta, X en (p x T1)
+    auto check_matrix_shape = [p, T1](const Matrix& M, const char* name) {
+        if (M.size() != p) {
+            throw std::invalid_argument(std::string(name) + ": nombre de lignes != p.");
         }
+        for (std::size_t i = 0; i < p; ++i) {
+            if (M[i].size() != T1) {
+                throw std::invalid_argument(std::string(name) + ": nombre de colonnes != T1 à la ligne " + std::to_string(i));
+            }
+        }
+    };
 
-        // 3. Décision d'Acceptation
-        if (tp > logUniformRvs()) {
-            beta[i] = beta_star[i]; 
-        } 
-        // Si rejeté, beta conserve sa valeur originale.
+    check_matrix_shape(IDH,      "IDH");
+    check_matrix_shape(lambda_1, "lambda_1");
+    check_matrix_shape(theta,    "theta");
+    //check_matrix_shape(X,        "X");
+    // Dimension l = nombre de colonnes de X (ici l = T1 si X est (p x T1))
+    const int l = static_cast<int>(X[0].size());
+    if (l <= 0) {
+        throw std::invalid_argument("fullPartition: l <= 0 (nb de colonnes de X).");
     }
-    
-    return beta;
-} */
+
+    // Hyper-param b_j (ici identique à b, mais tu peux changer)
+    double b_j = b;
+
+    // On ignore le m_neal passé si tu veux absolument 3
+    if (m_neal <= 0) m_neal = 3;
+
+    // Alias pour les vecteurs passés par référence
+    Vector& SS    = SS_in;   // labels de taille p*T1
+    Vector& CS    = CS_in;   // tailles de clusters
+    Vector& mu    = mu_in;
+    Vector& alpha = alpha_in;
+
+    // Vérifier SS a bien p*T1 éléments
+    if (SS.size() != p_T1) {
+        throw std::invalid_argument("fullPartition: SS.size() != p*T1.");
+    }
+
+    // Vérifier cohérence entre CS, mu, alpha
+    if (!(CS.size() == mu.size() && mu.size() == alpha.size())) {
+        throw std::invalid_argument("fullPartition: tailles incohérentes entre CS, mu, alpha.");
+    }
+
+    // Copies de sauvegarde
+    Vector mu_rrtp   = mu;
+    Vector alpha_rrtp= alpha;
+    Vector CS_rrtp   = CS;
+    Vector SS_tp     = SS;
+
+    int Ncl = static_cast<int>(CS.size());
+
+    // --- Boucle sur tous les points (i, t) ---
+    for (std::size_t t = 0; t < T1; ++t) {
+        for (std::size_t i = 0; i < p; ++i) {
+
+            const std::size_t flat_index = i + t * p;  // index 0..p*T1-1
+            int k0 = static_cast<int>(std::round(SS[flat_index])); // cluster actuel
+
+            // Sanity check: k0 peut être hors [0, Ncl-1] si SS est corrompu
+            if (k0 < 0 || k0 >= Ncl) {
+                // On force un retrait "sans cluster"
+                // ou tu peux décider de lancer une exception :
+                std::cerr << "Warning fullPartition: label k0=" << k0
+                          << " hors [0," << (Ncl-1) << "], on saute ce point.\n";
+                continue;
+            }
+
+            int k_star = 0; // indicateur de groupe perdu
+
+            // --- 1. Retrait de l'élément (i, t) du cluster k0 ---
+            if (k0 < static_cast<int>(CS.size()) && CS[k0] > 1.0) {
+                // On décrémente simplement la taille
+                CS[k0] -= 1.0;
+            } else {
+                // Cluster k0 est détruit
+
+                int kminus = Ncl - 1;    // dernier cluster (index Ncl-1)
+                Ncl -= 1;                // nouveau nombre de clusters = ancien - 1
+
+                if (k0 < Ncl) {
+                    // On permute le label kminus -> k0
+                    for (std::size_t l_idx = 0; l_idx < p_T1; ++l_idx) {
+                        int lab = static_cast<int>(std::round(SS[l_idx]));
+                        if (lab == kminus) {
+                            SS[l_idx] = static_cast<double>(k0);
+                        }
+                    }
+                    k_star = 1;
+                    SS[flat_index] = static_cast<double>(kminus);
+
+                    // Permutation des paramètres
+                    mu[k0]    = mu[kminus];
+                    alpha[k0] = alpha[kminus];
+                    CS[k0]    = CS[kminus];
+                }
+
+                // On supprime le dernier élément (kminus) de CS, mu, alpha
+                if (!CS.empty())    CS.pop_back();
+                if (!mu.empty())    mu.pop_back();
+                if (!alpha.empty()) alpha.pop_back();
+
+                Ncl = static_cast<int>(CS.size());
+            }
+
+            // On marque l'élément comme retiré
+            SS[flat_index] = -1.0;
+
+            // --- 2. Calcul des probabilités de proposition ---
+            const int kminus_current = Ncl;
+            const int h_neal         = kminus_current + m_neal;
+
+            if (kminus_current < 0 || h_neal <= 0) {
+                throw std::runtime_error("fullPartition: h_neal ou Ncl invalides.");
+            }
+
+            Vector prob(h_neal, 0.0);
+            Vector CS1(h_neal, -1.0);
+
+            // Copier CS dans CS1[0..Ncl-1]
+            for (int r = 0; r < kminus_current; ++r) {
+                if (r < static_cast<int>(CS.size())) {
+                    CS1[r] = CS[r];
+                } else {
+                    // Sécurité
+                    CS1[r] = 0.0;
+                }
+            }
+
+            // a) Clusters existants (j = 0 .. Ncl-1)
+            for (int j = 0; j < kminus_current; ++j) {
+                // Cohésion
+                SS[flat_index] = static_cast<double>(j);
+                CS1[j]=countNonzeroClusterJ(SS,j);
+
+                double g_xjStar = numerateur(CS1, j, b, l)
+                                  - denominateur(SS, X, j, CS1, l, b);
+
+                // Log-likelihood IDH
+                double b_j=alpha[j]*(1-mu[j]);
+                double a_j=alpha[j]*mu[j];
+                double log_lik_IDH = logBetaPDF(IDH[i][t], a_j, b_j);
+                SS[flat_index] = -1.0;
+                CS1[j]       -= 1.0;
+                double g_xj = numerateur(CS1, j, b, l)
+                                  - denominateur(SS, X, j, CS1, l, b);
+
+                // Log-proba
+                prob[j] = g_xjStar -g_xj+ log_lik_IDH + std::log(CS1[j]) + std::log(M);
+            }
+
+            // b) Nouveaux clusters (j = 0 .. m_neal-1)
+            Vector mu_tp(m_neal);
+            Vector alpha_tp(m_neal);
+
+            for (int j = 0; j < m_neal; ++j) {
+
+                const int j_new = kminus_current + j;   // index dans prob/CS1
+
+                // Tirage des paramètres du nouveau cluster
+                mu_tp[j] = sampleBeta(lambda_1[i][t], b_mu);
+                if (mu_tp[j] < 0.001) mu_tp[j] = 0.001;
+                if (mu_tp[j] > 0.999)  mu_tp[j] = 0.999;
+
+                alpha_tp[j] = sampleGamma(0.5 * theta[i][t], b_alpha);
+                if (alpha_tp[j] < 0.001) alpha_tp[j] = 0.001;
+
+                // Affectation temporaire
+                SS[flat_index]   = static_cast<double>(j_new);
+                CS1[j_new]       = 1.0;
+
+                // Cohésion
+                double g_xjStar = numerateur(CS1, j_new, b_j, l)
+                                  - denominateur(SS, X, j_new, CS1, l, b_j);
+
+                // Log-likelihood
+                double b_j=alpha_tp[j]*(1-mu_tp[j]);
+                double a_j=alpha_tp[j]*mu_tp[j];
+                double log_lik_new = logBetaPDF(IDH[i][t], a_j, b_j);
+
+                prob[j_new] = log_lik_new + g_xjStar + std::log(M / static_cast<double>(m_neal));
+
+                // reset
+                SS[flat_index]   = -1.0;
+                CS1[j_new]       = -1.0;  // on revient à l'état "sans ce point"
+            }
+            SS[flat_index]=kminus_current;
+
+            // --- 3. Normalisation & échantillonnage discret ---
+            double min_log_prob = prob[0];
+            double max_log_prob = prob[0];
+            for (double v : prob) {
+                if (v < min_log_prob) min_log_prob = v;
+                if (v > max_log_prob) max_log_prob = v;
+            }
+
+            Vector norm_prob(h_neal, 0.0);
+            double sum_exp = 0.0;
+
+            if (std::abs(min_log_prob - max_log_prob) < 1e-12) {
+                std::fill(norm_prob.begin(), norm_prob.end(), 1.0 / static_cast<double>(h_neal));
+            } else {
+                for (int k = 0; k < h_neal; ++k) {
+                    norm_prob[k] = std::exp((prob[k] - min_log_prob) / (max_log_prob - min_log_prob));
+                    sum_exp += norm_prob[k];
+                }
+                if (sum_exp <= 0.0 || !std::isfinite(sum_exp)) {
+                    std::cerr << "Warning fullPartition: sum_exp invalide, on passe à uniforme.\n";
+                    std::fill(norm_prob.begin(), norm_prob.end(), 1.0 / static_cast<double>(h_neal));
+                } else {
+                    for (int k = 0; k < h_neal; ++k) {
+                        norm_prob[k] /= sum_exp;
+                    }
+                }
+            }
+
+            int Ng = sampleDiscrete(norm_prob);  // doit retourner un int dans [0, h_neal-1]
+
+            if (Ng < 0 || Ng >= h_neal) {
+                std::cerr << "Warning fullPartition: Ng=" << Ng
+                          << " hors [0," << (h_neal-1) << "], on skip.\n";
+                continue;
+            }
+
+            // --- 4. Affectation finale ---
+            SS[flat_index] = static_cast<double>(Ng);
+
+            if (Ng < kminus_current) {
+                // cluster existant
+                CS[Ng] += 1.0;
+                if (k_star == 1) {
+                    std::cout << "On a perdu un groupe " << std::endl;
+                }
+            } else {
+                // nouveau cluster
+                int j_aux = Ng - kminus_current;  // 0..m_neal-1
+                SS[flat_index]=(double)kminus_current;
+                // Ajout des paramètres du nouveau cluster
+                mu.push_back(mu_tp[j_aux]);
+                alpha.push_back(alpha_tp[j_aux]);
+                CS.push_back(1.0);
+
+                Ncl = static_cast<int>(CS.size());
+            }
+
+        } // i
+    } // t
+
+    std::cout << "~~~~~~~~~~~~~~~~~~~~~~~~~FIN PARTITIONNMENT~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" << std::endl;
+    CS=calculateCs(SS);
+    Ncl= static_cast<int>(CS.size());
+    PriorPartitionResult result;
+    result.Ncl     = Ncl;
+    result.CS_r    = CS;
+    result.SS      = SS;
+    result.mu_r    = mu;
+    result.alpha_r = alpha;
+
+    return result;
+}*/
+
+
+
+
+
+
+
 
 
 /* Matrix fullLambdaPG(const Vector& r, double r_b, double xi, const Matrix& B, Matrix& lambda_PG, double sigma, const Vector& SS, const Vector& Y_flat, const Matrix& W_matrix) {
@@ -1598,6 +2133,9 @@ Matrix fullPsiPoll(const Vector& E, const Matrix& X, Matrix& psi, const Vector& 
     }
     return psi;
 }
+
+
+
 
 
 

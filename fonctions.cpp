@@ -5,9 +5,12 @@
 #include <algorithm> // pour std::copy
 #include <limits>    // <-- NOUVEAU : Nécessaire pour std::numeric_limits
 #include <random>
+#include <iomanip>  // Pour formater l'affichage des doubles
 #include <iostream>
 #include <cmath>     // <-- NOUVEAU : Nécessaire pour std::log et std::lgamma
 #include <map>
+#include <string>
+#include <plplot/plstream.h>// <-- for curbe
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -104,140 +107,134 @@ double euclideanDistanceSq(const Vector& a, const Vector& b) {
 
 
 KmeansResult kmeansSS(const Matrix& X, int T1, int K_init) {
-    size_t num_features = X.size();      // Nombre de lignes de X (l)
-    size_t num_points = X[0].size();     // Nombre de colonnes de X (p * T1)
-    size_t p = num_points / T1;          // Nombre de régions (p)
-    
-    // Le code Python utilise X.T (p*T1 x l). Nous allons transposer X pour travailler
-    // avec des lignes de données (point i = X_transposed[i])
-    Matrix X_data(num_points, Vector(num_features)); 
-    for (size_t j = 0; j < num_points; ++j) {
-        for (size_t i = 0; i < num_features; ++i) {
-            X_data[j][i] = X[i][j]; // X_data est (p*T1 x l)
+    if (T1 <= 0) {
+        throw std::invalid_argument("kmeansSS: T1 doit être > 0");
+    }
+    if (X.empty() || X[0].empty()) {
+        throw std::invalid_argument("kmeansSS: X doit être non vide");
+    }
+
+    size_t p = X.size();        // nb de régions
+    size_t l = X[0].size();     // nb de features par région
+    size_t num_points = p * (size_t)T1;
+    KmeansResult result;
+
+    // Transposition correcte : (p*T1 x l)
+    Matrix X_data(num_points, Vector(l, 0.0));
+    for (size_t t = 0; t < (size_t)T1; ++t) {
+        for (size_t i = 0; i < p; ++i) {
+            size_t idx = i + t * p;
+            for (size_t f = 0; f < l; ++f) {
+                X_data[idx][f] = X[i][f];
+            }
         }
     }
-    
-    // Assurer K_init est raisonnable
-    if (K_init <= 0 || K_init > num_points) {
-        K_init = (int)std::sqrt(p) + 1;
-    }
-    int K = K_init; // K est le nombre de clusters
-    
-    // --- Initialisation des Centres (K-Means++) ---
-    std::vector<Vector> centroids(K);
-    std::uniform_int_distribution<> initial_point_dist(0, num_points - 1);
-    
-    // Sélectionner le premier centre aléatoirement
-    centroids[0] = X_data[initial_point_dist(generator_prior)];
 
-    // Les autres centres sont initialisés par K-Means++ (méthode de sélection par distance)
-    std::vector<double> min_dist_sq(num_points);
+    if (K_init <= 0 || (size_t)K_init > num_points) {
+        K_init = static_cast<int>(std::sqrt((double)num_points)) + 1;
+    }
+    int K = K_init;
+
+    std::uniform_int_distribution<> initial_dist(0, num_points - 1);
+
+    // Initialiser les centroïdes
+    std::vector<Vector> centroids(K, Vector(l, 0.0));
+    centroids[0] = X_data[initial_dist(generator_prior)];
+
+    std::vector<double> min_dist_sq(num_points, 0.0);
+
     for (int k = 1; k < K; ++k) {
         double total_dist_sq = 0.0;
         for (size_t i = 0; i < num_points; ++i) {
-            double dist = std::numeric_limits<double>::max();
+            double best = std::numeric_limits<double>::max();
             for (int c = 0; c < k; ++c) {
-                dist = std::min(dist, euclideanDistanceSq(X_data[i], centroids[c]));
+                best = std::min(best, euclideanDistanceSq(X_data[i], centroids[c]));
             }
-            min_dist_sq[i] = dist;
-            total_dist_sq += dist;
+            min_dist_sq[i] = best;
+            total_dist_sq += best;
         }
-
-        // Sélectionner le prochain centre avec probabilité proportionnelle à min_dist_sq
-        std::uniform_real_distribution<double> uniform_01(0.0, 1.0);
-        double r = uniform_01(generator_prior) * total_dist_sq;
-        
-        double cumulative_sum = 0.0;
+        std::uniform_real_distribution<double> uniform_01(0.0, total_dist_sq);
+        double r = uniform_01(generator_prior);
+        double cum = 0.0;
         for (size_t i = 0; i < num_points; ++i) {
-            cumulative_sum += min_dist_sq[i];
-            if (cumulative_sum >= r) {
+            cum += min_dist_sq[i];
+            if (cum >= r) {
                 centroids[k] = X_data[i];
                 break;
             }
         }
     }
 
-    // --- Algorithme K-Means ---
-    Vector SS_result(num_points, 0.0); // Labels de cluster
-    std::vector<int> counts(K, 0); 
-    const int max_iterations = 100;
-    
-    for (int iter = 0; iter < max_iterations; ++iter) {
-        // Étape E (Affectation)
+    Vector SS_result(num_points, 0.0);
+    Vector ss_tp(num_points, -1.0);
+
+    std::vector<int> counts(K, 0);
+
+    const int max_iter = 100;
+    for (int iter = 0; iter < max_iter; ++iter) {
         bool changed = false;
+
+        // Affectation
         for (size_t i = 0; i < num_points; ++i) {
-            double min_dist = std::numeric_limits<double>::max();
-            int best_cluster = -1;
-            
-            for (int k = 0; k < K; ++k) {
-                double dist = euclideanDistanceSq(X_data[i], centroids[k]);
-                if (dist < min_dist) {
-                    min_dist = dist;
-                    best_cluster = k;
+            double best_dist = std::numeric_limits<double>::max();
+            int best_clust = 0;
+
+            for (int c = 0; c < K; ++c) {
+                double d = euclideanDistanceSq(X_data[i], centroids[c]);
+                if (d < best_dist) {
+                    best_dist = d;
+                    best_clust = c;
                 }
             }
-            if (SS_result[i] != (double)best_cluster) {
-                SS_result[i] = (double)best_cluster;
+            if (SS_result[i] != best_clust) {
+                SS_result[i] = (double)best_clust;
                 changed = true;
             }
         }
 
-        // Étape M (Mise à jour des Centres)
-        std::vector<Vector> new_centroids(K, Vector(num_features, 0.0));
+        // Mise à jour des centres
+        std::vector<Vector> new_centroids(K, Vector(l, 0.0));
         std::fill(counts.begin(), counts.end(), 0);
 
         for (size_t i = 0; i < num_points; ++i) {
-            int k = (int)SS_result[i];
-            counts[k]++;
-            for (size_t f = 0; f < num_features; ++f) {
-                new_centroids[k][f] += X_data[i][f];
+            int c = (int)SS_result[i];
+            counts[c]++;
+            for (size_t f = 0; f < l; ++f) {
+                new_centroids[c][f] += X_data[i][f];
             }
         }
-        
-        for (int k = 0; k < K; ++k) {
-            if (counts[k] > 0) {
-                for (size_t f = 0; f < num_features; ++f) {
-                    centroids[k][f] = new_centroids[k][f] / counts[k];
+
+        for (int c = 0; c < K; ++c) {
+            if (counts[c] > 0) {
+                for (size_t f = 0; f < l; ++f) {
+                    centroids[c][f] = new_centroids[c][f] / counts[c];
                 }
             }
-            // Si un cluster est vide, il peut être géré par réinitialisation ou simplement ignoré.
-            // Nous l'ignorons ici.
         }
-
-        if (!changed) break; // Arrêt si les affectations ne changent plus
+        if (!changed) break;
     }
 
-    // --- Préparation du Résultat Final (Similaire à f.kmeansSS en Python) ---
-
-    // CS (Tailles des clusters)
-    Vector CS_result(K, 0.0);
-    for (size_t k = 0; k < K; ++k) {
-        CS_result[k] = (double)counts[k];
-    }
-    
-    // Ncl (Nombre de clusters - peut être inférieur à K s'il y a des clusters vides)
-    size_t Ncl_final = K; 
-
-    // ma (Matrice d'adjacence)
-    Matrix ma(num_points, Vector(num_points, 0.0));
-    for (size_t i = 0; i < num_points; ++i) {
-        for (size_t j = 0; j < num_points; ++j) {
-            if (SS_result[i] == SS_result[j]) {
-                ma[i][j] = 1.0;
-            }
+    // Construire ss_tp = étiquettes répétées par période
+    for (size_t t = 0; t < (size_t)T1; ++t) {
+        for (size_t i = 0; i < p; ++i) {
+            ss_tp[i + t*p] = SS_result[i + t*p];
         }
     }
-    
-    // Note: Le code Python inclut une logique complexe de ré-indexation pour s'assurer
-    // que les labels de cluster sont contigus de 0 à Ncl-1, ce qui n'est pas fait ici.
-    // L'implémentation de la ré-indexation nécessite une fonction utilitaire DPMM.
 
-    KmeansResult result;
-    result.SS = SS_result;
-    result.CS = CS_result;
-    result.Ncl = Ncl_final;
-    result.ma = ma;
-    
+    result.SS   = std::move(ss_tp);
+    result.CS   = Vector(K, 0.0);
+    for (int c = 0; c < K; ++c) {
+        result.CS[c] = static_cast<double>(counts[c] * T1);
+    }
+    result.Ncl = K;
+
+    result.ma.assign(p, Vector(p, 0.0));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t j = 0; j < p; ++j) {
+            if (SS_result[i] == SS_result[j]) result.ma[i][j] = 1.0;
+        }
+    }
+
     return result;
 }
   
@@ -261,11 +258,13 @@ double logBetaPDF(double x, double alpha, double beta) {
 // matrice transposer
 Matrix XXt(const Vector& X) {
     size_t l = X.size();
-    Matrix M(l, Vector(l)); // Initialise une matrice l x l
+    Matrix M(l, Vector(l, 0.0));
 
     for (size_t i = 0; i < l; ++i) {
-        for (size_t j = 0; j < l; ++j) {
-            M[i][j] = X[i] * X[j];
+        for (size_t j = i; j < l; ++j) {
+            double val = X[i] * X[j];
+            M[i][j] = val;
+            M[j][i] = val; // symétrie
         }
     }
     return M;
@@ -289,36 +288,62 @@ double trace(const Matrix& M) {
 
 
 /**
- * Implémentation de l'sample_Betapour une matrice triangulaire supérieure (comme en Python)
+ * Implémentation de l'sampleBeta pour une matrice triangulaire supérieure (comme en Python)
  * L'implémentation complète pour une matrice quelconque est complexe et nécessiterait Eigen.
  */
+
+
 Matrix Inverse(const Matrix& Phi) {
-    size_t p = Phi.size();
-    if (p == 0) return Matrix();
-    if (p != Phi[0].size()) throw std::invalid_argument("La matrice doit être carrée.");
+    const size_t p = Phi.size();
+    if (p == 0) {
+        return Matrix();
+    }
 
-    Matrix IPhi(p, Vector(p, 0.0));
-
-    for (size_t i = 0; i < p; ++i) {
-        // La diagonale
-        if (std::abs(Phi[i][i]) < 1e-9) { // Vérification de la division par zéro
-            throw std::runtime_error("Erreur: La diagonale contient un zéro ou est trop petite.");
-        }
-        IPhi[i][i] = 1.0 / Phi[i][i];
-
-        // Remplissage de la partie supérieure
-        for (size_t j = i - 1; j > 0; --j) {
-            double somme = 0.0;
-            // Note: La boucle Python a une erreur de borne, elle devrait ressembler à ceci
-            // for k in range(j + 1, i + 1):  ... somme += Phi[j, k] * IPhi[k, i]
-            for (size_t k = j + 1; k <= i; ++k) {
-                somme += Phi[j][k] * IPhi[k][i];
-            }
-            IPhi[j][i] = -somme / Phi[j][j];
+    // Vérifier que la matrice est carrée
+    for (size_t r = 0; r < p; ++r) {
+        if (Phi[r].size() != p) {
+            throw std::invalid_argument("Inverse: la matrice doit être carrée.");
         }
     }
+
+    Matrix IPhi(p, Vector(p, 0.0));
+    constexpr double tol = 1e-9;
+
+    // Pré-calcul des inverses de la diagonale (et vérification)
+    Vector inv_diag(p);
+    for (size_t i = 0; i < p; ++i) {
+        const double dii = Phi[i][i];
+        if (std::abs(dii) < tol) {
+            throw std::runtime_error("Inverse: diagonale nulle ou trop petite.");
+        }
+        inv_diag[i] = 1.0 / dii;
+    }
+
+    // Inversion d'une matrice triangulaire supérieure
+    for (size_t i = 0; i < p; ++i) {
+        // Diagonale
+        IPhi[i][i] = inv_diag[i];
+
+        // Partie supérieure: j = i-1, ..., 0
+        for (size_t j = i; j-- > 0; ) {
+            double somme = 0.0;
+
+            const Vector& rowPhi_j = Phi[j];
+            const Vector& colInv_i = IPhi[i]; // on va lire IPhi[k][i] via col, mais on reste 2D
+            // k = j+1..i
+            for (size_t k = j + 1; k <= i; ++k) {
+                somme += rowPhi_j[k] * IPhi[k][i];
+            }
+
+            // IPhi[j,i] = - somme / Phi[j,j] = - somme * inv_diag[j]
+            IPhi[j][i] = -somme * inv_diag[j];
+        }
+    }
+
     return IPhi;
 }
+ 
+
 
 
 /**
@@ -402,6 +427,42 @@ Matrix lire_csv_vers_matrix(const std::string& chemin_fichier, bool header, char
 }
 
 
+Matrix readCSV(const std::string &filename) {
+    std::ifstream file(filename);
+
+    if (!file.is_open()) {
+        std::cerr << "Erreur : impossible d'ouvrir le fichier " << filename << "\n";
+        return {};
+    }
+
+    Matrix data;
+    std::string line;
+
+    while (std::getline(file, line)) {
+        // Ignore les lignes vides
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos)
+            continue;
+
+        std::stringstream ss(line);
+        std::string cell;
+        Vector row;
+
+        while (std::getline(ss, cell, ',')) {
+            try {
+                row.push_back(std::stod(cell));
+            } catch (...) {
+                std::cerr << "Erreur de conversion dans le CSV : '" << cell << "'\n";
+                row.push_back(0.0); // fallback
+            }
+        }
+
+        data.push_back(row);
+    }
+
+    return data;
+}
+
+
 // ... (Inclure la fonction lire_csv_vers_matrix ici si elle n'est pas dans le .h)
 DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
                                 const std::string& chemin_fichier_VaRep,
@@ -422,6 +483,7 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
 
         size_t p = table_cov.size(); // Nombre d'individus (lignes)
         size_t cols = table_cov[0].size();
+        //result.Ville.assign(StringVector(p));
         
         // l = np.size(table[0,:])-1
         // Si la première colonne est la ville (nom), on assume qu'elle a été sautée
@@ -432,7 +494,8 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
         size_t l = cols; // l est le nombre de covariables (colonnes numériques restantes)
 
         // X: Matrice l x p (Transposée de table1 en Python)
-        result.X.assign(l, Vector(p));
+        //result.X.assign(l, Vector(p));
+        result.X.assign(p, Vector(l));
 
         // table1 = table[:, 1:(l+1)] (La lecture python ignore la colonne 0 (Ville))
         // Notre `lire_csv_vers_matrix` ci-dessus *doit* être ajustée pour gérer le saut de colonne.
@@ -440,7 +503,7 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
         for (size_t i = 0; i < p; ++i) { // lignes (individus)
             for (size_t j = 0; j < l; ++j) { // colonnes (covariables)
                 // Le Python fait la transposition de (p x l) vers (l x p)
-                result.X[j][i] = table_cov[i][j];
+                result.X[i][j] = table_cov[i][j];
             }
         }
 
@@ -450,15 +513,15 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
         if (l >= 2 && p == 32) {
              Vector new_longitude = {-102.3726689,-115.1425107,-111.5706164,-90.0,-102.0000001,-104.0,-92.5000001,-106.0000001, -99.1441352, -104.833333 , -101.0,-100.0,-99.0,-103.6666671,-99.1331785, -101.878113 ,-99.0,-105.0000001,-94.9841472,-96.5,-98.0,-99.8837376, -88.5000001,-100.4949145,-107.5000001,-110.6666671,-92.6681659,-98.7026825,-98.166667, -96.666667,-88.8755669,-102.9333954 };
              Vector new_latitude = {21.9942689,30.0338923,25.5818014,19.0,27.3333331,19.166667,16.5000001,28.5000001,  23.7389846 ,24.833333, 20.9876996,17.666667,20.5, 20.3333331,19.4326296, 19.207098, 18.75, 22.0000001,16.2048579, 17.0,18.833333, 20.8052225, 19.6666671,22.5000001,25.0000001,29.3333331,17.9999288,23.9891553,19.416667, 19.333333,20.6845957,23.0916177};
-            
             // X[l-2,:] = ... (Avant-dernière ligne)
-            if (result.X.size() > (size_t)l - 2) {
-                result.X[l-2] = new_longitude;
+            if (result.X[0].size() > (size_t)l - 2) {
+                for (size_t i = 0; i < p; ++i) result.X[i][l-2] = new_longitude[i];
             }
 
             // X[l-1,:] = ... (Dernière ligne)
-            if (result.X.size() > (size_t)l - 1) {
-                result.X[l-1] = new_latitude;
+            if (result.X[0].size() > (size_t)l - 1) {
+                for (size_t i = 0; i < p; ++i) result.X[i][l-1] =  new_latitude[i];
+                
             }
         }
         
@@ -473,20 +536,21 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
             result.IDHPre.resize(p);
             for (size_t i = 0; i < p; ++i) {
                 result.IDHPre[i] = IDH1[i][T1_cols - 1];
+                //result.Ville[i]=IDH1[i][1]; 
             }
         }
         
         // IDH =IDH1[:,2:(T1-1)] (Colonnes de 2 à T1_cols-2)
         // La nouvelle T1 est T1_cols - 3
-        result.T1 = (int)(T1_cols - 3);
+        result.T1 = (int)(T1_cols-2);
         
         if (result.T1 > 0) {
-            size_t start_col = 2;
+            size_t start_col = 1;
             size_t end_col = T1_cols - 2;
 
             result.IDH.assign(p, Vector((size_t)result.T1));
             for (size_t i = 0; i < p; ++i) {
-                for (size_t j = start_col; j < end_col; ++j) {
+                for (size_t j = start_col; j <= end_col; ++j) {
                     result.IDH[i][j - start_col] = IDH1[i][j];
                 }
             }
@@ -494,29 +558,32 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
 
     } else {
         // --- LOGIQUE STATE=FALSE (header=False, sep=',') ---
-        
-        // table=pd.read_csv(chemin_fichier_covariable) (header=False, sep=',')
+         std::cout << "---Dans le else du chargement" << std::endl;
+        // table=pd.read_csv(chemin_fichier_covariable) (header=False, sep=',') ICI ICI 
         Matrix table_cov = lire_csv_vers_matrix(chemin_fichier_covariable, false, ',');
-        
+        //Matrix  table_cov =readCSV(chemin_fichier_covariable);
         if (table_cov.empty()) {
             throw std::runtime_error("Erreur: Table des covariables vide.");
         }
 
         size_t p = table_cov.size();
-        size_t l = table_cov[0].size();
-        
+        size_t l = table_cov[0].size();    // number of colons 
+        std::cout << "---p vaut" << p<<std::endl;
+        std::cout << "---l vaut" << l<<std::endl;
         // X = table.T (Transposition)
-        result.X.assign(l, Vector(p));
+        result.X.assign(p, Vector(l));
         for (size_t i = 0; i < p; ++i) {
             for (size_t j = 0; j < (size_t)l; ++j) {
-                result.X[j][i] = table_cov[i][j];
+                result.X[i][j] = table_cov[i][j];
             }
         }
         
         // IDH1=pd.read_csv(chemin_fichier_VaRep)
         Matrix IDH1 = lire_csv_vers_matrix(chemin_fichier_VaRep, false, ',');
+        // ICI ICI ICI
+        //Matrix IDH1=readCSV(chemin_fichier_VaRep);
         
-        size_t T1_cols = IDH1[0].size();
+        size_t T1_cols = IDH1[0].size();   // number of periods
         
         // IDHPre=IDH1[:,T1-1] (Dernière colonne)
         if (T1_cols > 0) {
@@ -528,8 +595,9 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
         
         // IDH =IDH1[:,0:(T1-1)] (Toutes les colonnes sauf la dernière)
         // La nouvelle T1 est T1_cols - 1
-        result.T1 =(int)( T1_cols - 1);
-        
+        //result.T1 =(int)( T1_cols - 1);
+        result.T1 = (int)(T1_cols-1);
+        std::cout << "---T1  vaut" << result.T1<<std::endl;
         if (result.T1 > 0) {
             result.IDH.assign(p, Vector((size_t)result.T1));
             for (size_t i = 0; i < p; ++i) {
@@ -540,7 +608,7 @@ DonneesChargees chargesDonnees(const std::string& chemin_fichier_covariable,
         }
     }
 
-    result.l = (int) result.X.size(); // Mise à jour finale du l (nombre de covariables)
+    result.l = (int) result.X[0].size(); // Mise à jour finale du l (nombre de covariables)
     return result;
 }
 
@@ -695,44 +763,72 @@ Matrix covJPoll(const Vector& S, const Matrix& Data, int j, const Vector& Cs, in
 }
 
 
-Vector mubarj(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l) {
-    // tp = 0*np.zeros(l) -> Vecteur de taille l initialisé à zéro (pour la somme)
-    Vector tp(l, 0.0);
-    
-    if (X.empty() || l == 0) return tp; 
-    
-    // p = Nombre d'individus (colonnes dans X)
-    size_t p = X[0].size(); 
-    size_t taille_S = S.size(); 
-    
-    // Vérifier la taille du cluster (Cs[j])
-    if (j >= Cs.size() || Cs[j] <= 0) {
-        // Le cluster j n'existe pas ou est vide.
-        throw std::invalid_argument("Erreur dans mubarj: Le cluster j est vide ou l'indice est invalide.");
+Vector mubarj(const Vector& S,
+              const Matrix& X,   // X est de taille l x p
+              int j,
+              const Vector& Cs,
+              int l)
+{
+    // Vecteur résultat de taille l initialisé à zéro
+    if (l <= 0) {
+        return Vector(); // ou Vector(0) si tu préfères un vecteur vide explicite
     }
-    
-    // Boucle sur toutes les entrées du vecteur de regroupement S
-    for (size_t i = 0; i < taille_S; ++i) {
-        // if(S[i]==(j)):
-        if (static_cast<int>(S[i]) == j) {
-            
-            // i_0 = i % p -> Indice de l'individu (colonne) dans X
-            size_t i_0 = i % p;
-            
-            // tp = tp + X[:,i_0] (Sommation du vecteur colonne)
-            for (int k = 0; k < l; ++k) {
-                // X[k][i_0] car X est (l x p)
-                tp[k] += X[k][i_0]; 
+
+    const size_t L = static_cast<size_t>(l);
+    Vector tp(L, 0.0);
+
+    if (X.empty()) {
+        return tp;
+    }
+
+    // p = nombre d'individus (colonnes de X)
+    const size_t p = X[0].size();
+    const size_t taille_S = S.size();
+
+    // Vérifications de dimensions
+    if (X.size() != L) {
+        throw std::invalid_argument("mubarj: X.size() != l (nombre de lignes).");
+    }
+    for (size_t row = 0; row < L; ++row) {
+        if (X[row].size() != p) {
+            throw std::invalid_argument("mubarj: toutes les lignes de X doivent avoir la même taille p.");
+        }
+    }
+    if (p == 0 || taille_S == 0) {
+        return tp;
+    }
+    if (taille_S % p != 0) {
+        throw std::invalid_argument("mubarj: S.size() doit être un multiple de p.");
+    }
+
+    if (j < 0 || static_cast<size_t>(j) >= Cs.size()) {
+        throw std::invalid_argument("mubarj: indice de cluster j invalide.");
+    }
+
+    const double Cs_j = Cs[static_cast<size_t>(j)];
+    if (Cs_j <= 0.0) {
+        // Cluster vide : on renvoie un vecteur de zéros
+        return tp;
+    }
+
+    // Accumulation des colonnes correspondant au cluster j
+    const int j_int = j;
+    for (size_t idx = 0; idx < taille_S; ++idx) {
+        if (static_cast<int>(S[idx]) == j_int) {
+            // i_0 = idx % p -> indice de la colonne dans X
+            const size_t i0 = idx % p;
+            for (size_t k = 0; k < L; ++k) {
+                tp[k] += X[k][i0];
             }
         }
     }
-    
-    // return (tp/Cs[j]) -> Division par la taille du cluster
-    double Cs_j = Cs[j];
-    for (int k = 0; k < l; ++k) {
-        tp[k] /= Cs_j;
+
+    // Moyenne : division par la taille du cluster
+    const double inv_Cs_j = 1.0 / Cs_j;
+    for (size_t k = 0; k < L; ++k) {
+        tp[k] *= inv_Cs_j;
     }
-    
+
     return tp;
 }
 
@@ -742,30 +838,25 @@ double multigammaln(double a, int p) {
         throw std::invalid_argument("multigammaln: La dimension p doit être >= 1.");
     }
     
-    // Condition de validité : a doit être > (p - 1) / 2
+    // a doit être > (p - 1) / 2
     if (a <= (static_cast<double>(p) - 1.0) / 2.0) {
-        // En cas de paramètre non valide pour la fonction Gamma
         std::cerr << "Attention: Argument 'a' trop petit pour la dimension 'p'." << std::endl;
-        // On pourrait retourner -infinity si l'on veut simuler le comportement de SciPy
         return -std::numeric_limits<double>::infinity(); 
     }
     
     double result = 0.0;
-    
-    // Partie 1: p * (p-1) / 4 * log(pi)
     result += (static_cast<double>(p) * (p - 1) / 4.0) * std::log(M_PI);
     
-    // Partie 2: somme_{i=1}^{p} log(Gamma(a + (1-i)/2))
     for (int i = 1; i <= p; ++i) {
-        // Le terme est (1-i)/2
         double term = (1.0 - static_cast<double>(i)) / 2.0;
-        
-        // std::lgamma(x) calcule log(Gamma(x))
         result += std::lgamma(a + term);
     }
     
     return result;
 }
+
+
+
 
 
 double  numerateur(const Vector& Cs, int j,double b_j, int l){
@@ -802,56 +893,33 @@ double  numerateur(const Vector& Cs, int j,double b_j, int l){
 }
 
 
-double det(const Matrix& M) {
-    size_t n = M.size();
-    if (n == 0) return 0.0;
-    if (n != M[0].size()) {
-        throw std::invalid_argument("Erreur det: La matrice doit être carrée.");
+double det(const Matrix& M) { 
+    // le code fonctionne pour les matrices symetries definies positives.
+    const size_t n = M.size();
+    if (n == 0) {
+        return 0.0;
+    }
+    if (M[0].size() != n) {
+        throw std::invalid_argument("detSPD: la matrice doit être carrée.");
     }
 
-    // Création d'une copie de la matrice pour éviter de modifier l'originale
-    Matrix A = M; 
-    double determinant = 1.0;
-    int sign = 1;
+    // Cholesky: M = L L^T, L triangulaire inférieure
+    Matrix L = cholesky(M);
 
-    // Élimination de Gauss
+    double diag_prod = 1.0;
     for (size_t i = 0; i < n; ++i) {
-        // 1. Pivotage partiel (pour la stabilité)
-        size_t pivot = i;
-        for (size_t j = i + 1; j < n; ++j) {
-            if (std::abs(A[j][i]) > std::abs(A[pivot][i])) {
-                pivot = j;
-            }
+        const double lii = L[i][i];
+        if (lii <= 0.0) {
+            // En théorie, pour SPD on ne devrait jamais passer ici
+            throw std::runtime_error("detSPD: L(i,i) <= 0, M n'est pas SPD ?");
         }
-
-        if (pivot != i) {
-            // Échange les lignes i et pivot
-            std::swap(A[i], A[pivot]);
-            // Chaque échange de ligne inverse le signe du déterminant
-            sign *= -1; 
-        }
-
-        // Vérification de la singularité (le pivot est presque zéro)
-        if (std::abs(A[i][i]) < 1e-12) { 
-            return 0.0; // Le déterminant est zéro (matrice singulière)
-        }
-
-        // 2. Élimination
-        for (size_t j = i + 1; j < n; ++j) {
-            double factor = A[j][i] / A[i][i];
-            for (size_t k = i; k < n; ++k) {
-                A[j][k] -= factor * A[i][k];
-            }
-        }
+        diag_prod *= lii;
     }
 
-    // 3. Calcul du déterminant (produit des éléments diagonaux)
-    for (size_t i = 0; i < n; ++i) {
-        determinant *= A[i][i];
-    }
-
-    return sign * determinant;
+    // det(M) = (prod diag(L))^2
+    return diag_prod * diag_prod;
 }
+
 
 
 double denominateur(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l, double b_j) {
@@ -1043,265 +1111,244 @@ Vector truncatedNormalSample(double mu, double sigma, double a, double b, size_t
 }
 
 
-double betaFunction(double x, double y) {
-    
-    // Vérification des conditions : x et y doivent être positifs pour la fonction Gamma
-    if (x <= 0.0 || y <= 0.0) {
-        throw std::invalid_argument("Erreur betaFunction: Les arguments x et y doivent être strictement positifs.");
-    }
-    
-    // Calcul de Gamma(x) * Gamma(y) / Gamma(x + y)
-    
-    // NOTE IMPORTANTE : Utiliser le logarithme pour le calcul est plus stable numériquement
-    // (pour éviter les dépassements de capacité avec de grandes valeurs de Gamma).
-    // Cependant, votre code Python utilisait la multiplication/division directe.
-    
-    // --- Approche directe (comme le Python) ---
-    double gamma_x = std::tgamma(x);
-    double gamma_y = std::tgamma(y);
-    double gamma_sum = std::tgamma(x + y);
-
-    if (std::abs(gamma_sum) < 1e-18) {
-        // Gérer le cas où Gamma(x+y) est trop petit ou zéro (problème numérique)
-        return std::numeric_limits<double>::infinity();
-    }
-    
-    return (gamma_x * gamma_y) / gamma_sum;
-    
-    // --- Approche Logarithmique (plus stable, si nécessaire) ---
-    /*
-    double log_beta = std::lgamma(x) + std::lgamma(y) - std::lgamma(x + y);
-    return std::exp(log_beta);
-    */
-}
-
-
-
-
-
 Matrix EchantillonPsi(const Matrix& A, const Matrix& T, double b) {
-    size_t p = A.size();
-    if (p == 0) return Matrix();
-    if (p != A[0].size() || p != T.size() || p != T[0].size()) {
-        throw std::invalid_argument("EchantillonPsi: Les matrices A et T doivent être carrées de même dimension p.");
+    const size_t p = A.size();
+    if (p == 0) {
+        return Matrix();  // rien à faire
     }
-    
-    // Initialisation
-    Vector nui(p, 0.0);
-    Vector hi(p, 0.0);
+
+    if (A[0].size() != p || T.size() != p || T[0].size() != p) {
+        throw std::invalid_argument(
+            "EchantillonPsi: A et T doivent être des matrices carrées de dimension p."
+        );
+    }
+
+    // --- Initialisation ---
+    Vector nui(p, 0.0);                 // nombre de voisins "suivants"
     Matrix T1(p, Vector(p, 0.0));
     Matrix Psi(p, Vector(p, 0.0));
-    
-    // --- Étape 1: Calculer T1, hi, nui ---
-    for (size_t j = 0; j < p; ++j) {
-        
-        // Calcul de T1 = T[:,j] / T[j,j]
-        if (std::abs(T[j][j]) < 1e-18) {
-             throw std::runtime_error("EchantillonPsi: T[j][j] est nul, division impossible.");
-        }
-        for (size_t r = 0; r < p; ++r) {
-            T1[r][j] = T[r][j] / T[j][j];
-        }
-        
-        // hi[j]: Nombre de voisins précédents (somme A[j, 0:j])
-        if (j > 0) {
-            for (size_t k = 0; k < j; ++k) {
-                hi[j] += A[j][k];
-            }
-        }
-        
-        // nui[j]: Nombre de voisins suivants (somme A[j, j+1:p])
-        if (j < p - 1) {
-            for (size_t k = j + 1; k < p; ++k) {
-                nui[j] += A[j][k];
-            }
-        }
-    }
-    
-    // --- Étape 2: Échantillonnage des diagonales et des termes A[i,j]=1 (i < j) ---
-    // (Les étapes 2 et 3 sont fusionnées ici pour simplifier)
 
-    // Déclaration des distributions
-    std::normal_distribution<double> normal_dist(0.0, 1.0);
-    
-    for (size_t i = 0; i < p; ++i) {
-        
-        // Diagonale: Psi[i,i] ~ sqrt(Chi^2(b + nui[i]))
-        double df_chi = b + nui[i];
-        if (df_chi <= 0) {
-            throw std::runtime_error("EchantillonPsi: Degré de liberté Chi-carré invalide.");
+    constexpr double tol = 1e-18;
+
+    // --- Étape 1 : T1 et nui ---
+    for (size_t j = 0; j < p; ++j) {
+        const double Tjj = T[j][j];
+        if (std::abs(Tjj) < tol) {
+            throw std::runtime_error("EchantillonPsi: T[j,j] est nul, division impossible.");
         }
+        const double invTjj = 1.0 / Tjj;
+
+        // T1(:,j) = T(:,j) / T(j,j)
+        for (size_t r = 0; r < p; ++r) {
+            T1[r][j] = T[r][j] * invTjj;
+        }
+
+        // nui[j] = somme des voisins A[j,k] pour k > j
+        double nuij = 0.0;
+        const Vector& Aj = A[j];
+        for (size_t k = j + 1; k < p; ++k) {
+            nuij += Aj[k];
+        }
+        nui[j] = nuij;
+    }
+
+    // --- Étape 2 : échantillonnage des diagonales et des A[i,j]=1 ---
+    std::normal_distribution<double> normal_dist(0.0, 1.0);
+
+    for (size_t i = 0; i < p; ++i) {
+        const double df_chi = b + nui[i];
+        if (df_chi <= 0.0) {
+            throw std::runtime_error("EchantillonPsi: degré de liberté chi2 invalide (<= 0).");
+        }
+
         std::chi_squared_distribution<double> chi_sq_dist(df_chi);
-        
         Psi[i][i] = std::sqrt(chi_sq_dist(generator));
-        
-        // Termes hors diagonale supérieur où A[i,j]=1
+
+        // Termes hors diagonale où A[i,j] == 1
+        const Vector& Ai = A[i];
         for (size_t j = i + 1; j < p; ++j) {
-            if (static_cast<int>(A[i][j]) == 1) {
-                // Psi[i,j] ~ N(0, 1)
+            if (Ai[j] != 0.0) {
                 Psi[i][j] = normal_dist(generator);
             }
         }
     }
-    
-    // --- Étape 3 & 4: Calcul des termes A[i,j]=0 (i < j) par backward-substitution ---
-    // (Ceci correspond à la partie compliquée de votre code Python avec les sommes s1 et s2)
-    
+
+    // Helper : somme_{k = start}^{end-1} Psi[row,k] * T1[k,col]
+    auto dotPsiT1 = [&](size_t rowPsi, size_t start, size_t end, size_t colT1) -> double {
+        double s = 0.0;
+        for (size_t k = start; k < end; ++k) {
+            s += Psi[rowPsi][k] * T1[k][colT1];
+        }
+        return s;
+    };
+
+    // --- Étape 3 & 4 : termes A[i,j] == 0 par backward-substitution ---
     for (size_t i = 0; i < p; ++i) {
+        const double Psi_ii = Psi[i][i];
+        double invPsi_ii = 0.0;
+        bool invPsi_ii_ready = false;
+
         for (size_t j = i + 1; j < p; ++j) {
-            // Si le lien est absent (A[i,j] = 0), nous calculons Psi[i,j]
-            if (static_cast<int>(A[i][j]) == 0) {
-                
-                // Formule: Psi[i,j] = - sum_{k=i}^{j-1} Psi[i,k] * T1[k,j]
-                double sum1 = 0.0;
-                for (size_t k = i; k < j; ++k) {
-                    sum1 += Psi[i][k] * T1[k][j];
-                }
-                Psi[i][j] = -sum1;
-                
-                // Pour i > 0, il y a la correction complexe impliquant s1 et s2:
-                // Psi[i,j] -= sum_{r=1}^{i-1} s1_r * s2_r
-                if (i > 0) {
-                    double correction_sum = 0.0;
-                    for (size_t r = 0; r < i; ++r) {
-                        
-                        // Calcul de s1 = (Psi[r,i] + sum_{k=r}^{i-1} Psi[r,k] * T1[k,i]) / Psi[i,i]
-                        double sum_s1 = 0.0;
-                        for (size_t k = r; k < i; ++k) {
-                            sum_s1 += Psi[r][k] * T1[k][i];
-                        }
-                        
-                        double s1;
-                        if (std::abs(Psi[i][i]) < 1e-18) {
-                            throw std::runtime_error("EchantillonPsi: Division par zéro (Psi[i][i] est nul).");
-                        }
-                        s1 = (Psi[r][i] + sum_s1) / Psi[i][i];
-                        
-                        // Calcul de s2 = Psi[r,j] + sum_{k=r}^{j-1} Psi[r,k] * T1[k,j]
-                        double sum_s2 = 0.0;
-                        for (size_t k = r; k < j; ++k) {
-                            sum_s2 += Psi[r][k] * T1[k][j];
-                        }
-                        double s2 = Psi[r][j] + sum_s2;
-                        
-                        correction_sum += s1 * s2;
-                    }
-                    Psi[i][j] -= correction_sum;
-                }
+            if (A[i][j] != 0.0) {
+                continue; // on ne recalcul pas les liens présents
             }
+
+            // Psi[i,j] = - sum_{k=i}^{j-1} Psi[i,k] * T1[k,j]
+            double psi_ij = -dotPsiT1(i, i, j, j);
+
+            // Correction si i > 0
+            if (i > 0) {
+                if (!invPsi_ii_ready) {
+                    if (std::abs(Psi_ii) < tol) {
+                        throw std::runtime_error(
+                            "EchantillonPsi: division par zéro (Psi[i,i] nul) dans la correction."
+                        );
+                    }
+                    invPsi_ii = 1.0 / Psi_ii;
+                    invPsi_ii_ready = true;
+                }
+
+                double correction_sum = 0.0;
+
+                for (size_t r = 0; r < i; ++r) {
+                    // s1 = (Psi[r,i] + sum_{k=r}^{i-1} Psi[r,k] * T1[k,i]) / Psi[i,i]
+                    const double s1_num = Psi[r][i] + dotPsiT1(r, r, i, i);
+                    const double s1     = s1_num * invPsi_ii;
+
+                    // s2 = Psi[r,j] + sum_{k=r}^{j-1} Psi[r,k] * T1[k,j]
+                    const double s2 = Psi[r][j] + dotPsiT1(r, r, j, j);
+
+                    correction_sum += s1 * s2;
+                }
+
+                psi_ij -= correction_sum;
+            }
+
+            Psi[i][j] = psi_ij;
         }
     }
-    
+
     return Psi;
 }
 
 
-Matrix echantillonPsiMod(Matrix& Psi, Matrix& A, const Matrix& T, double b, size_t i1, size_t j1, bool Etat, double tp) {
-    size_t p = A.size();
-    if (p == 0) return Matrix();
-    
-    // Initialisation et vérifications
-    Vector nui(p, 0.0);
-    Vector hi(p, 0.0);
-    Matrix T1(p, Vector(p, 0.0));
-    
-    // Vérification des indices
-    if (i1 >= p || j1 >= p || i1 >= j1) { // On travaille uniquement sur la partie triangulaire supérieure (i1 < j1)
-         throw std::invalid_argument("echantillonPsiMod: Les indices du lien sont invalides ou i1 >= j1.");
+Matrix echantillonPsiMod(Matrix& Psi,
+                         Matrix& A,
+                         const Matrix& T,
+                         double b,
+                         size_t i1,
+                         size_t j1,
+                         bool Etat,
+                         double tp) // tp inutilisé mais conservé pour la compatibilité
+{
+    const size_t p = A.size();
+    if (p == 0) {
+        // On retourne la même structure si la matrice est vide
+        return Psi;
     }
 
-    // --- Étape 1: Modification du lien (A[i1, j1]) ---
+    // Vérifications de base
+    if (T.size() != p || T[0].size() != p) {
+        throw std::invalid_argument("echantillonPsiMod: T doit être une matrice p x p.");
+    }
+    if (Psi.size() != p || Psi[0].size() != p) {
+        throw std::invalid_argument("echantillonPsiMod: Psi doit être une matrice p x p.");
+    }
+
+    // On travaille uniquement sur la triangulaire supérieure (i1 < j1)
+    if (i1 >= p || j1 >= p || i1 >= j1) {
+        throw std::invalid_argument("echantillonPsiMod: indices invalides ou i1 >= j1.");
+    }
+
+    // --- Étape 1 : modification du lien A[i1, j1] ---
     std::normal_distribution<double> normal_dist(0.0, 1.0);
 
     if (Etat) {
-        // Ajout d'un lien (Etat=True)
-        // print("we are adding an egde")
-        A[i1][j1] = 1.0; 
-        A[j1][i1] = 1.0; // Symétrie
-        Psi[i1][j1] = normal_dist(generator); // Échantillonner N(0, 1) pour le nouveau lien
+        // Ajout d'un lien
+        A[i1][j1] = 1.0;
+        A[j1][i1] = 1.0;
+        Psi[i1][j1] = normal_dist(generator); // N(0,1) pour le nouveau lien
     } else {
-        // Suppression d'un lien (Etat=False)
-        // print("we are removing an egde")
+        // Suppression d'un lien
         A[i1][j1] = 0.0;
-        A[j1][i1] = 0.0; // Symétrie
-        // La valeur tp (originale de Psi[i1,j1]) est implicitement sauvegardée dans la logique MCMC
-        Psi[i1][j1] = 0.0; // Mis à zéro, puis recalculé à l'étape 3/4
+        A[j1][i1] = 0.0;
+        Psi[i1][j1] = 0.0; // sera recalculé avec les formules ci-dessous
     }
-    
-    // --- Étape 2: Calculer T1, hi, nui (Recalculé après la modification de A) ---
-    // Cette étape est nécessaire car 'nui' (nombre de voisins suivants) a pu changer
+
+    // --- Étape 2 : calcul de T1 = T(:,j) / T(j,j) ---
+    Matrix T1(p, Vector(p, 0.0));
     for (size_t j = 0; j < p; ++j) {
-        if (std::abs(T[j][j]) < 1e-18) {
-             throw std::runtime_error("echantillonPsiMod: T[j][j] est nul, division impossible.");
+        const double Tjj = T[j][j];
+        if (std::abs(Tjj) < 1e-18) {
+            throw std::runtime_error("echantillonPsiMod: T[j][j] est nul, division impossible.");
         }
+        const double invTjj = 1.0 / Tjj;
         for (size_t r = 0; r < p; ++r) {
-            T1[r][j] = T[r][j] / T[j][j];
-        }
-        // Recalculer hi et nui
-        hi[j] = 0.0; nui[j] = 0.0;
-        if (j > 0) {
-            for (size_t k = 0; k < j; ++k) {
-                hi[j] += A[j][k];
-            }
-        }
-        if (j < p - 1) {
-            for (size_t k = j + 1; k < p; ++k) {
-                nui[j] += A[j][k];
-            }
+            T1[r][j] = T[r][j] * invTjj;
         }
     }
 
-    // --- Étape 3 & 4: Recalcul des termes A[i,j]=0 par backward-substitution ---
-    // On itère sur tous les termes de la triangulaire supérieure (i < j)
+    // Helper pour remplacer les sommes de type :
+    // sum_{k = start}^{end-1} Psi[row, k] * T1[k, col]
+    auto dotPsiT1 = [&](size_t rowPsi, size_t start, size_t end, size_t colT1) -> double {
+        double s = 0.0;
+        for (size_t k = start; k < end; ++k) {
+            s += Psi[rowPsi][k] * T1[k][colT1];
+        }
+        return s;
+    };
+
+    // --- Étape 3 & 4 : backward-substitution sur les termes A[i,j] == 0, i < j ---
     for (size_t i = 0; i < p; ++i) {
+        const double Psi_ii = Psi[i][i];
+        double invPsi_ii = 0.0;
+        bool invPsi_ii_ready = false;
+
         for (size_t j = i + 1; j < p; ++j) {
-            
-            // Si le lien est absent (A[i,j] = 0), nous calculons Psi[i,j]
-            // Le cas i=i1, j=j1 est inclus si A[i1,j1] a été mis à zéro (suppression)
-            if (static_cast<int>(A[i][j]) == 0) {
-                
-                // Formule de base: Psi[i,j] = - sum_{k=i}^{j-1} Psi[i,k] * T1[k,j]
-                double sum_base = 0.0;
-                for (size_t k = i; k < j; ++k) {
-                    sum_base += Psi[i][k] * T1[k][j];
-                }
-                Psi[i][j] = -sum_base;
-                
-                // Correction complexe (uniquement pour i > 0)
-                if (i > 0) {
-                    double correction_sum = 0.0;
-                    for (size_t r = 0; r < i; ++r) {
-                        
-                        // Calcul de s1 = (Psi[r,i] + sum_{k=r}^{i-1} Psi[r,k] * T1[k,i]) / Psi[i,i]
-                        double sum_s1 = 0.0;
-                        for (size_t k = r; k < i; ++k) {
-                            sum_s1 += Psi[r][k] * T1[k][i];
-                        }
-                        
-                        double s1;
-                        if (std::abs(Psi[i][i]) < 1e-18) {
-                            throw std::runtime_error("echantillonPsiMod: Division par zéro (Psi[i][i] est nul pendant la correction).");
-                        }
-                        s1 = (Psi[r][i] + sum_s1) / Psi[i][i];
-                        
-                        // Calcul de s2 = Psi[r,j] + sum_{k=r}^{j-1} Psi[r,k] * T1[k,j]
-                        double sum_s2 = 0.0;
-                        for (size_t k = r; k < j; ++k) {
-                            sum_s2 += Psi[r][k] * T1[k][j];
-                        }
-                        double s2 = Psi[r][j] + sum_s2;
-                        
-                        correction_sum += s1 * s2;
-                    }
-                    Psi[i][j] -= correction_sum;
-                }
+
+            // On ne recalcule Psi[i,j] que si l'arête est absente
+            if (A[i][j] != 0.0) {
+                continue;
             }
+
+            // Terme de base :
+            // Psi[i,j] = - sum_{k=i}^{j-1} Psi[i,k] * T1[k,j]
+            double psi_ij = -dotPsiT1(i, i, j, j);
+
+            // Correction si i > 0
+            if (i > 0) {
+                if (!invPsi_ii_ready) {
+                    if (std::abs(Psi_ii) < 1e-18) {
+                        throw std::runtime_error(
+                            "echantillonPsiMod: division par zéro (Psi[i,i] nul) dans la correction."
+                        );
+                    }
+                    invPsi_ii = 1.0 / Psi_ii;
+                    invPsi_ii_ready = true;
+                }
+
+                double correction_sum = 0.0;
+
+                for (size_t r = 0; r < i; ++r) {
+                    // s1 = (Psi[r,i] + sum_{k=r}^{i-1} Psi[r,k] * T1[k,i]) / Psi[i,i]
+                    const double s1_num = Psi[r][i] + dotPsiT1(r, r, i, i);
+                    const double s1 = s1_num * invPsi_ii;
+
+                    // s2 = Psi[r,j] + sum_{k=r}^{j-1} Psi[r,k] * T1[k,j]
+                    const double s2 = Psi[r][j] + dotPsiT1(r, r, j, j);
+
+                    correction_sum += s1 * s2;
+                }
+
+                psi_ij -= correction_sum;
+            }
+
+            Psi[i][j] = psi_ij;
         }
     }
-    
-    return Psi;
-}
 
+    return Psi; // modifié en place, retour pour compatibilité
+}
 /**
  * Calcule la transposée d'une matrice M.
  */
@@ -1332,12 +1379,15 @@ MatricesPrecision precisionMatrix(const Matrix& Psi) {
     if (n != Psi[0].size()) {
         throw std::invalid_argument("Erreur precisionMatrix: La matrice Psi doit être carrée.");
     }
+    double detb=0;
+    for (size_t i=0; i<n;++i) {detb +=2*std::log(Psi[i][i]);}
 
     MatricesPrecision result;
 
     // 1. Calculer Omega = Psi^T * Psi
     Matrix Psi_T = Transpose(Psi);
     result.Omega = multiplyMatrices(Psi_T, Psi);
+    result.detb=detb;
     
     // 2. Calculer Sigma = Omega^-1
     // ATTENTION: Omega est une matrice PLÈNE symétrique. 
@@ -1362,89 +1412,116 @@ MatricesPrecision precisionMatrix(const Matrix& Psi) {
     return result;
 }
 
-
 double constanteNormalisation(const Matrix& A, double b, const Matrix& T, size_t count) {
-    size_t p = A.size();
-    if (p == 0 || count == 0) return 0.0;
-    
-    // Initialisation
-    double const_term = 0.0;
+    const size_t p = A.size();
+    if (p == 0 || count == 0) {
+        return 0.0;
+    }
+
+    if (T.size() != p || T[0].size() != p) {
+        throw std::invalid_argument("constanteNormalisation: T doit être une matrice p x p.");
+    }
+
+    // --- 0. Pré-calculs ---
+    const double log2pi = std::log(2.0 * M_PI);
+    const double log2   = std::log(2.0);
+
+    // --- 1. hi et nui ---
+    // hi[j] = somme des A[j,k] pour k < j
+    // nui[j] = somme des A[j,k] pour k > j
     Vector hi(p, 0.0);
     Vector nui(p, 0.0);
-    
-    // Matrice AA = np.ones((p,p))
-    Matrix AA(p, Vector(p, 1.0));
 
-    // --- Étape 1: Calculer hi et nui (nombre de voisins) ---
     for (size_t j = 0; j < p; ++j) {
-        // hi[j]: Nombre de voisins précédents (somme A[j, 0:j])
-        if (j > 0) {
-            for (size_t k = 0; k < j; ++k) {
-                hi[j] += A[j][k];
-            }
+        const Vector& Aj = A[j];
+        double hij = 0.0;
+        double nuij = 0.0;
+
+        for (size_t k = 0; k < j; ++k) {
+            hij += Aj[k];
         }
-        
-        // nui[j]: Nombre de voisins suivants (somme A[j, j+1:p])
-        if (j < p - 1) {
-            for (size_t k = j + 1; k < p; ++k) {
-                nui[j] += A[j][k];
-            }
+        for (size_t k = j + 1; k < p; ++k) {
+            nuij += Aj[k];
         }
+
+        hi[j]  = hij;
+        nui[j] = nuij;
     }
 
-    // --- Étape 2: Calculer la partie analytique (const) ---
+    // --- 2. Partie analytique ---
+    double const_term = 0.0;
+
     for (size_t i = 0; i < p; ++i) {
-        double nui_i = nui[i];
-        double hi_i = hi[i];
-        
-        // Terme 1: np.log(math.gamma(0.5*(b+nui[i])))
-        // Note: L'utilisation de std::lgamma est préférable à std::log(std::tgamma)
-        const_term += std::lgamma(0.5 * (b + nui_i)); 
-        
-        // Terme 2: (0.5*nui[i])*np.log(2*math.pi)
-        const_term += (0.5 * nui_i) * std::log(2.0 * M_PI);
-        
-        // Terme 3: (b+ nui[i]+hi[i])*np.log(T[i,i])
-        if (T[i][i] <= 0.0) {
+        const double nui_i = nui[i];
+        const double hi_i  = hi[i];
+
+        const double Tii = T[i][i];
+        if (Tii <= 0.0) {
             throw std::runtime_error("constanteNormalisation: T[i,i] doit être positif.");
         }
-        const_term += (b + nui_i + hi_i) * std::log(T[i][i]);
-        
-        // Terme 4: (0.5*(nui[i]+b))*np.log(2)
-        const_term += (0.5 * (nui_i + b)) * std::log(2.0);
+
+        // np.log(gamma(0.5*(b + nui[i])))
+        const_term += std::lgamma(0.5 * (b + nui_i));
+
+        // (0.5 * nui[i]) * log(2*pi)
+        const_term += 0.5 * nui_i * log2pi;
+
+        // (b + nui[i] + hi[i]) * log(T[i,i])
+        const_term += (b + nui_i + hi_i) * std::log(Tii);
+
+        // 0.5*(nui[i] + b) * log(2)
+        const_term += 0.5 * (nui_i + b) * log2;
     }
-    
-    // --- Étape 3: Calculer l'intégrale par Monte Carlo (f) ---
-    double f_sum = 0.0;
-    // La boucle Python était "range(count-1)". En C++, on peut faire "size_t j = 0; j < count;"
-    // pour avoir 'count' échantillons. J'utilise 'count' itérations.
-    for (size_t j = 0; j < count; ++j) {
-        
-        // 1. Échantillonner Psi
+
+    // --- 3. Monte Carlo ---
+    // AA = matrice de 1 (pour 1 - A)
+    Matrix AA(p, Vector(p, 1.0));
+
+    // On veut log( (1/count) * sum_j exp(z_j) ), z_j = -0.5 * inner_sum_j
+    // Pour la stabilité numérique, on fait un log-sum-exp.
+    std::vector<double> log_terms;
+    log_terms.reserve(count);
+
+    for (size_t iter = 0; iter < count; ++iter) {
         Matrix Psi = EchantillonPsi(A, T, b);
-        
-        // 2. Calculer le terme dans l'exponentielle: -0.5*np.sum((AA-A)*(Psi*Psi))
+
         double inner_sum = 0.0;
         for (size_t r = 0; r < p; ++r) {
+            const Vector& AAr = AA[r];
+            const Vector& Ar  = A[r];
+            const Vector& Psir = Psi[r];
             for (size_t c = 0; c < p; ++c) {
-                // Terme à sommer: (AA[r,c] - A[r,c]) * (Psi[r,c] * Psi[r,c])
-                inner_sum += (AA[r][c] - A[r][c]) * std::pow(Psi[r][c], 2.0);
+                const double diff = AAr[c] - Ar[c];     // = 1 - A[r][c]
+                const double x    = Psir[c];
+                inner_sum += diff * (x * x);           // Psi^2 sans std::pow
             }
         }
-        
-        // Ajouter à la somme Monte Carlo: f += exp(...)
-        f_sum += std::exp(-0.5 * inner_sum);
+
+        const double z = -0.5 * inner_sum;
+        log_terms.push_back(z);
     }
-    
-    // --- Étape 4: Calcul final ---
-    // return const + np.log(f_sum) - np.log(count)
-    if (f_sum <= 0.0) {
-        std::cerr << "Erreur constanteNormalisation: La somme Monte Carlo est nulle ou négative." << std::endl;
+
+    // log-sum-exp des z_j
+    double max_log = log_terms[0];
+    for (size_t k = 1; k < log_terms.size(); ++k) {
+        if (log_terms[k] > max_log) {
+            max_log = log_terms[k];
+        }
+    }
+
+    double sum_exp = 0.0;
+    for (double z : log_terms) {
+        sum_exp += std::exp(z - max_log);
+    }
+
+    if (sum_exp <= 0.0 || !std::isfinite(sum_exp)) {
+        std::cerr << "constanteNormalisation: somme Monte Carlo invalide, renvoie -inf.\n";
         return -std::numeric_limits<double>::infinity();
     }
-    
-    double log_Z = const_term + std::log(f_sum) - std::log(static_cast<double>(count));
-    
+
+    const double log_f_sum = max_log + std::log(sum_exp);
+    const double log_Z = const_term + log_f_sum - std::log(static_cast<double>(count));
+
     return log_Z;
 }
 
@@ -1480,198 +1557,216 @@ Matrix structureMatrice(const Matrix& Omega) {
 
 
 Matrix retirerUnNoeud(const Matrix& Omega) {
-    size_t p = Omega.size();
-    if (p == 0) return Matrix();
-    if (p != Omega[0].size()) {
-        throw std::invalid_argument("Erreur retirerUnNoeud: La matrice Omega doit être carrée.");
+    const size_t p = Omega.size();
+    
+    // Cas matrice vide : on renvoie la même
+    if (p == 0) {
+        return Omega;
     }
 
-    // Création de la copie (omegaPrime = Omega.copy())
+    if (Omega[0].size() != p) {
+        throw std::invalid_argument("retirerUnNoeud: la matrice Omega doit être carrée.");
+    }
+
+    // Copie de travail
     Matrix omegaPrime = Omega;
-    
-    // Initialisation de la valeur minimale (on utilise la limite max de double)
+
+    constexpr double tol = 1e-12;
+
     double min_abs_value = std::numeric_limits<double>::max();
-    int i_0 = -1; // Indices pour le nœud à retirer
+    int i_0 = -1;
     int j_0 = -1;
 
-    // Recherche de la plus petite valeur absolue hors diagonale
+    // Recherche de la plus petite valeur absolue non nulle (hors diagonale, triangulaire sup)
     for (size_t i = 0; i < p; ++i) {
-        for (size_t j = i + 1; j < p; ++j) { // Parcours seulement la triangulaire supérieure (hors diagonale)
-            
-            double current_value = Omega[i][j];
-            double current_abs = std::abs(current_value);
-            
-            // Si la valeur est non nulle (au-delà d'une petite tolérance)
-            // ET si elle est plus petite que le minimum actuel
-            if (current_abs > 1e-12 && current_abs < min_abs_value) {
-                min_abs_value = current_abs;
-                i_0 = static_cast<int>(i); 
+        const Vector& row = Omega[i];
+        for (size_t j = i + 1; j < p; ++j) {
+            const double val = row[j];
+            const double aval = std::abs(val);
+
+            if (aval > tol && aval < min_abs_value) {
+                min_abs_value = aval;
+                i_0 = static_cast<int>(i);
                 j_0 = static_cast<int>(j);
             }
         }
     }
 
-    // --- Retrait du nœud ---
+    // Si on a trouvé une arête à retirer
     if (i_0 != -1 && j_0 != -1) {
-        // Mettre à zéro l'élément trouvé et son symétrique pour garantir la symétrie
         omegaPrime[i_0][j_0] = 0.0;
         omegaPrime[j_0][i_0] = 0.0;
-        
-        // Affichage (similaire à un print de débogage si vous en aviez un)
-        // std::cout << "Lien retire : (" << i_0 << ", " << j_0 << ") avec Omega = " << min_abs_value << std::endl;
+        // Optionnel: debug
+        // std::cout << "Lien retire: (" << i_0 << ", " << j_0
+        //           << ") valeur abs = " << min_abs_value << '\n';
     } else {
-        // Cas où il n'y a plus de liens hors diagonale à retirer (graphe vide)
-        // std::cout << "Aucun lien hors diagonale trouve à retirer." << std::endl;
+        // Aucune arête hors diagonale à retirer -> graphe déjà vide
+        // On renvoie simplement la même structure (omegaPrime == Omega)
     }
-    
+
     return omegaPrime;
 }
-
 /**
  * Traduction de ajoutUnNoeud(aOmega)
  * Propose aléatoirement l'ajout d'un lien (A[i,j]=0) par échantillonnage.
  */
 PropAjoutRetrait ajoutUnNoeud(const Matrix& aOmega) {
-    size_t p = aOmega.size();
+    const size_t p = aOmega.size();
     if (p < 2) {
-        throw std::invalid_argument("Erreur ajoutUnNoeud: La dimension p doit être >= 2.");
+        throw std::invalid_argument("ajoutUnNoeud: dimension p < 2.");
     }
-    
-    // Initialisation
-    PropAjoutRetrait result;
-    // aomegaPrime = aOmega.copy()
-    result.A = aOmega; 
-    
-    bool valeur = true;
-    int it = 10; // Limite d'itération (comme dans le Python)
-    
-    // Distribution uniforme pour choisir un indice (0 à p-1)
-    std::uniform_int_distribution<> distrib_p(0, p - 1);
-    
-    // Indices initiaux
-    size_t i_0_temp = 0, j_0_temp = 0; 
-    
-    while (valeur && it > 0) {
-        it--;
-        
-        // Echantillonner i_0 et j_0 (0 à p-1)
-        i_0_temp = distrib_p(generator); 
-        j_0_temp = distrib_p(generator); 
 
-        // Condition d'acceptation: i_0 != j_0 ET A[i_0, j_0] == 0 (lien absent)
-        if (i_0_temp != j_0_temp && std::abs(aOmega[i_0_temp][j_0_temp]) < 1e-12) {
-            
-            // print("###########Essai reussi!!!!!!!#############")
-            
-            // Ajout du lien (symétrique)
-            result.A[i_0_temp][j_0_temp] = 1.0;
-            result.A[j_0_temp][i_0_temp] = 1.0;
-            
-            // S'assurer que i0 est le plus petit des deux pour le retour
-            if (j_0_temp < i_0_temp) {
-                std::swap(i_0_temp, j_0_temp);
+    PropAjoutRetrait result;
+    result.A = aOmega;      // on part d'une copie de la structure existante
+    result.i0 = 0;
+    result.j0 = 0;
+
+    constexpr double tol = 1e-12;
+    constexpr int max_tries = 10;
+
+    // Distribution uniforme sur {0, ..., p-1}
+    std::uniform_int_distribution<size_t> distrib_p(0, p - 1);
+
+    bool success = false;
+    size_t i_0 = 0, j_0 = 0;
+
+    // --- 1) Essais aléatoires limités ---
+    for (int attempt = 0; attempt < max_tries && !success; ++attempt) {
+        const size_t i = distrib_p(generator);
+        const size_t j = distrib_p(generator);
+
+        if (i == j) continue; // pas de boucle sur soi-même
+
+        // On teste sur la matrice originale aOmega pour savoir si le lien existe déjà
+        if (std::abs(aOmega[i][j]) < tol) {
+            // Ajout de l'arête dans la copie
+            result.A[i][j] = 1.0;
+            result.A[j][i] = 1.0;
+
+            if (j < i) {
+                i_0 = j;
+                j_0 = i;
+            } else {
+                i_0 = i;
+                j_0 = j;
             }
-            
-            result.i0 = i_0_temp;
-            result.j0 = j_0_temp;
-            
-            valeur = false; // Succès
+
+            result.i0 = i_0;
+            result.j0 = j_0;
+            success   = true;
         }
     }
-    
-    // --- Gestion du Cas d'Échec (it <= 0) : Recherche séquentielle ---
-    // Le Python passe à la recherche séquentielle pour garantir un ajout, sauf si le graphe est complet
-    if (valeur) {
-        // Recherche séquentielle du premier lien manquant (i < j)
+
+    // --- 2) Si les essais aléatoires échouent, recherche déterministe ---
+    if (!success) {
         for (size_t i = 0; i < p; ++i) {
             for (size_t j = i + 1; j < p; ++j) {
-                // Si le lien est absent (A[i,j] == 0)
-                if (std::abs(aOmega[i][j]) < 1e-12) {
-                    
+                if (std::abs(aOmega[i][j]) < tol) {
                     result.A[i][j] = 1.0;
                     result.A[j][i] = 1.0;
-                    
+
                     result.i0 = i;
                     result.j0 = j;
-                    
-                    valeur = false;
-                    return result; // Retourne immédiatement après avoir trouvé et ajouté le premier lien
+                    success   = true;
+                    return result; // on sort dès qu’on a trouvé un lien manquant
                 }
             }
         }
-        
-        // Si 'valeur' est toujours true ici, cela signifie que le graphe est complet.
-        if (valeur) {
-            throw std::runtime_error("ajoutUnNoeud: Le graphe est déjà complet (pas de lien à ajouter).");
-        }
     }
 
+    // --- 3) Cas pire : graphe complet ---
+    // Aucun lien à ajouter -> on retourne la structure d'origine telle quelle
+    // result.A est déjà égal à aOmega, i0/j0 laissés à 0 par convention.
     return result;
 }
 
 
-Matrix S_epsi(const Matrix& theta, double xi) {
-    size_t p = theta.size(); // Nombre de régions/lignes (dimension du vecteur)
-    if (p == 0) return Matrix();
-    
-    size_t T1 = theta[0].size(); // Nombre de périodes de temps (colonnes)
-    if (T1 < 1) return Matrix(); 
+/**
+ * Traduction de S_epsi(theta, xi)
+ * Calcule la matrice de somme de carrés des erreurs S_epsilon.
+ */
+Matrix S_epsi(const Matrix& theta, const Vector& xi) {
+    const size_t p = theta.size(); // Nombre de lignes
+    if (p == 0) {
+        throw std::invalid_argument("S_epsi: Matrice theta est vide.");
+    }
 
-    // Initialisation de la matrice de résultat (p x p)
-    Matrix tp(p, Vector(p, 0.0));
-    
-    // --- Terme Initial: XXt(np.log(theta[:,0])) ---
-    
-    // 1. Extraire et appliquer log à theta[:, 0]
-    Vector log_theta_0(p);
+    const size_t T1 = theta[0].size(); // Nombre de périodes
+    if (T1 < 1) {
+        return Matrix(p, Vector(p, 0.0));
+    }
+
+    if (xi.size() != p) {
+        throw std::invalid_argument("S_epsi: Le vecteur xi doit être de taille p.");
+    }
+
+    // Vérifier que toutes les lignes de theta ont la même longueur
     for (size_t i = 0; i < p; ++i) {
-        if (theta[i][0] <= 0.0) {
-             throw std::runtime_error("S_epsi: Erreur log, theta[i, 0] doit être positif.");
+        if (theta[i].size() != T1) {
+            throw std::invalid_argument("S_epsi: theta a des lignes de tailles différentes.");
         }
-        log_theta_0[i] = std::log(theta[i][0]);
     }
-    
-    // 2. Calculer XXt et initialiser tp
-    tp = XXt(log_theta_0);
 
-    // --- Boucle de Sommation: sum_{t=0}^{T1-2} XXt(xi * log(theta[:, t]) - log(theta[:, t+1])) ---
-    
-    for (size_t t = 0; t < T1 - 1; ++t) {
-        
-        // Calculer le vecteur epsi_t = xi * log(theta[:, t]) - log(theta[:, t+1])
-        Vector epsi_t(p);
-        
-        for (size_t i = 0; i < p; ++i) {
-            double log_t;
-            double log_t_plus_1;
-            
-            if (theta[i][t] <= 0.0 || theta[i][t+1] <= 0.0) {
-                 throw std::runtime_error("S_epsi: Erreur log, theta[i, t] ou theta[i, t+1] doit être positif.");
+    // --- Pré-calcul des logs de theta ---
+    Matrix log_theta(p, Vector(T1));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t t = 0; t < T1; ++t) {
+            const double val = theta[i][t];
+            if (val <= 0.0) {
+                throw std::runtime_error("S_epsi: Erreur log, theta[i,t] doit être > 0.");
             }
-
-            log_t = std::log(theta[i][t]);
-            log_t_plus_1 = std::log(theta[i][t+1]);
-            
-            // xi * log(theta[:, t]) - log(theta[:, t+1])
-            epsi_t[i] = xi * log_t - log_t_plus_1; 
+            log_theta[i][t] = std::log(val);
         }
-        
-        // Calculer XXt(epsi_t)
-        Matrix XXt_t = XXt(epsi_t);
-        
-        // Sommation de la matrice: tp += XXt_t
+    }
+
+    // --- Matrice résultat (p x p), initialisée à 0 ---
+    Matrix tp(p, Vector(p, 0.0));
+
+    // --- Terme initial : XXt(log(theta[:,0])) ---
+    // v = log_theta[:,0]
+    {
+        // produit externe v v^T, en exploitant la symétrie
         for (size_t r = 0; r < p; ++r) {
-            for (size_t c = 0; c < p; ++c) {
-                tp[r][c] += XXt_t[r][c];
+            const double vr = log_theta[r][0];
+            for (size_t c = 0; c <= r; ++c) {
+                const double vc   = log_theta[c][0];
+                const double val  = vr * vc;
+                tp[r][c] += val;
+                if (c != r) {
+                    tp[c][r] += val;
+                }
             }
         }
     }
-    
+
+    // --- Boucle sur t = 0..T1-2 pour les epsi_t ---
+    Vector epsi_t(p, 0.0);
+
+    for (size_t t = 0; t + 1 < T1; ++t) {
+        // epsi_t[i] = xi[i] * log_theta[i][t] - log_theta[i][t+1]
+        for (size_t i = 0; i < p; ++i) {
+            epsi_t[i] = xi[i] * log_theta[i][t] - log_theta[i][t + 1];
+        }
+
+        // Ajouter XXt(epsi_t) à tp, toujours en utilisant la symétrie
+        for (size_t r = 0; r < p; ++r) {
+            const double vr = epsi_t[r];
+            for (size_t c = 0; c <= r; ++c) {
+                const double vc   = epsi_t[c];
+                const double val  = vr * vc;
+                tp[r][c] += val;
+                if (c != r) {
+                    tp[c][r] += val;
+                }
+            }
+        }
+    }
+
     return tp;
 }
 
 
-double logLikhoodBetaJ(const Matrix& X, const Matrix& ALPHA, const Matrix& BETA, const Vector& S, int j) {
+double logLikhoodBetaJ(const Matrix& X, const double& ALPHA, const double& BETA, const Vector& S, int j) {
     size_t p = X.size(); // Nombre de régions (lignes)
     if (p == 0) return 0.0;
     
@@ -1699,13 +1794,8 @@ double logLikhoodBetaJ(const Matrix& X, const Matrix& ALPHA, const Matrix& BETA,
             if (i >= p || t >= T) {
                  throw std::runtime_error("Erreur logLikhoodBetaJ: Calcul d'indice i, t incorrect.");
             }
-
-            double x_it = X[i][t];
-            double alpha_it = ALPHA[i][t];
-            double beta_it = BETA[i][t];
-
             // Accumuler la log-vraisemblance du PDF Bêta
-            tp += logBetaPDF(x_it, alpha_it, beta_it);
+            tp += logBetaPDF(X[i][t], ALPHA, BETA);
         }
     }
     
@@ -1921,52 +2011,38 @@ std::pair<int, int> isValueInMatrix(const Vector& SS, int i, int t, int p) {
 }
 
 
-Vector meanSS(const Vector& S, const Matrix& X, int j, const Vector& Cs, int l) {
-    // tp = 0*np.zeros(l) -> Vecteur de taille l initialisé à zéro (pour la somme)
-    Vector tp(l, 0.0);
-    
-    if (X.empty() || l == 0) return tp; 
-    
-    // p = Nombre d'individus/états (colonnes dans X)
-    // Nous devons déterminer la dimension des données. 
-    // Si X est (l x p*T), alors p_total = p*T. Si X est (l x p), p_total = p.
-    size_t p_total = X[0].size(); 
-    size_t taille_S = S.size(); 
-    
-    // Vérification de base (S doit avoir la même taille que le nombre d'entités dans X)
-    if (taille_S != p_total) {
-        throw std::invalid_argument("Erreur meanSS: La taille de S ne correspond pas au nombre total d'entités dans X.");
+double meanSS(const Matrix& X, const Vector& S, int j) {
+    const size_t p = X.size();             // nombre de lignes
+    if (p == 0) return 0.0;
+
+    const size_t T1 = X[0].size();         // nombre de périodes
+    const size_t expected_size = p * T1;
+
+    if (S.size() != expected_size) {
+        throw std::invalid_argument("meanSS: S.size() != p * T1");
     }
-    
-    // Vérifier la taille du cluster (Cs[j])
-    if (j >= Cs.size() || Cs[j] <= 0) {
-        // Le cluster j n'existe pas ou est vide.
-        throw std::invalid_argument("Erreur meanSS: Le cluster j est vide ou l'indice est invalide.");
-    }
-    
-    // Boucle sur toutes les entrées du vecteur de regroupement S
-    for (size_t i = 0; i < taille_S; ++i) {
-        // if(S[i]==(j)):
-        if (static_cast<int>(S[i]) == j) {
-            
-            // i_0 est l'indice de l'entité (colonne) dans X
-            size_t i_0 = i; 
-            
-            // tp = tp + X[:,i_0] (Sommation du vecteur colonne)
-            for (int k = 0; k < l; ++k) {
-                // X[k][i_0] car X est (l x p_total)
-                tp[k] += X[k][i_0]; 
+
+    double sum = 0.0;
+    int count = 0;
+
+    for (size_t t = 0; t < T1; ++t) {
+        const size_t offset = t * p;
+        for (size_t i = 0; i < p; ++i) {
+            const size_t index = offset + i;  // index dans S
+
+            if (static_cast<int>(S[index]) == j) {
+                sum += X[i][t];
+                ++count;
             }
         }
     }
-    
-    // return (tp/Cs[j]) -> Division par la taille du cluster
-    double Cs_j = Cs[j];
-    for (int k = 0; k < l; ++k) {
-        tp[k] /= Cs_j;
+
+    if (count == 0) {
+        // Aucun élément dans le cluster j → éviter un NaN
+        return 0.0;
     }
-    
-    return tp;
+
+    return sum / count;
 }
 
 
@@ -2056,106 +2132,296 @@ double numpySumSlice(const Matrix& M1, size_t r1, size_t c1_start, size_t c1_end
  * Modifie Psi* et A* après l'ajout ou la suppression du lien (i1, j1).
  * Note: i1, j1 sont des indices 0-basés après la conversion depuis le Python.
  */
-Matrix EchantillonPsiMod(Matrix& Psi, Matrix& A, const Matrix& T, double b, size_t i1, size_t j1, bool Etat, double tp) {
-    size_t p = A.size();
-    if (p == 0) return Matrix();
-    
-    // T1 est la matrice T[:,j] / T[j,j]
-    Matrix T1(p, Vector(p, 0.0));
-    
+Matrix EchantillonPsiMod(Matrix& Psi,
+                         Matrix& A,
+                         const Matrix& T,
+                         double b,
+                         size_t i1,
+                         size_t j1,
+                         bool Etat,
+                         double tp) // tp inutilisé mais on garde la signature
+{
+    const size_t p = A.size();
+    if (p == 0) {
+        return Matrix();
+    }
+
+    constexpr bool verbose = false;
+
     // --- 1. Modification du lien (A[i1, j1]) ---
     std::normal_distribution<double> normal_dist(0.0, 1.0);
 
     if (Etat) {
-        // Ajout d'un lien (Etat=True)
-        std::cout << "we are adding an egde" << std::endl;
-        A[i1][j1] = 1.0; 
-        A[j1][i1] = 1.0; // Symétrie
-        Psi[i1][j1] = normal_dist(generator_prior); // Échantillonner N(0, 1) pour le nouveau lien
+        if (verbose) std::cout << "we are adding an edge\n";
+        A[i1][j1] = 1.0;
+        A[j1][i1] = 1.0;
+        Psi[i1][j1] = normal_dist(generator_prior); // N(0,1) pour le nouveau lien
     } else {
-        // Suppression d'un lien (Etat=False)
-        std::cout << "we are removing an egde" << std::endl;
+        if (verbose) std::cout << "we are removing an edge\n";
         A[i1][j1] = 0.0;
-        A[j1][i1] = 0.0; // Symétrie
-        // Psi[i1,j1] est mis à zéro dans la boucle de mise à jour des zéros
+        A[j1][i1] = 0.0;
+        // Psi[i1][j1] sera mis à jour plus bas si nécessaire
     }
-    
-    // --- 2. Calculer T1 = T[:,j] / T[j,j] ---
+
+    // --- 2. Calculer T1 = T(:,j) / T(j,j) ---
+    Matrix T1(p, Vector(p, 0.0));
+
     for (size_t j = 0; j < p; ++j) {
-        if (std::abs(T[j][j]) < 1e-18) {
-             throw std::runtime_error("EchantillonPsiMod: T[j,j] est nul, division impossible.");
+        const double Tjj = T[j][j];
+        if (std::abs(Tjj) < 1e-18) {
+            throw std::runtime_error("EchantillonPsiMod: T[j,j] est nul, division impossible.");
         }
+        const double invTjj = 1.0 / Tjj;
         for (size_t r = 0; r < p; ++r) {
-            T1[r][j] = T[r][j] / T[j][j];
+            T1[r][j] = T[r][j] * invTjj;
         }
     }
 
-    // --- 3. Mise à jour de la première ligne (i=0) ---
-    // i=1 en Python (indice 1-basé) correspond à i=0 en C++
-    size_t i_c = 0; // i_c = i-1 en Python
-    size_t j_c = i_c + 1;
-    
-    while (j_c < p) { // j_c < p correspond à j <= p en Python
-        if (std::abs(A[i_c][j_c]) < 1e-12) { // Si A[i_c, j_c] == 0
-            
-            // Calculer np.sum(Psi[i-1,(i-1):(j-1)]*T1[(i-1):(j-1),j-1])
-            // (Psi[0, 0:j_c] * T1[0:j_c, j_c])
-            double sum_term = numpySumSlice(Psi, i_c, i_c, j_c, T1, i_c, j_c, j_c);
-
-            Psi[i_c][j_c] = -1.0 * sum_term;
+    // Petit helper inline pour remplacer numpySumSlice :
+    // somme_{k=start}^{end-1} Psi[rowPsi, k] * T1[k, colT1]
+    auto dotPsiT1 = [&](size_t rowPsi, size_t start, size_t end, size_t colT1) -> double {
+        double s = 0.0;
+        for (size_t k = start; k < end; ++k) {
+            s += Psi[rowPsi][k] * T1[k][colT1];
         }
-        j_c++;
+        return s;
+    };
+
+    // --- 3. Mise à jour première ligne (i = 0) ---
+    size_t i_c = 0;
+    for (size_t j_c = i_c + 1; j_c < p; ++j_c) {
+        if (std::abs(A[i_c][j_c]) < 1e-12) { // A[i_c, j_c] == 0
+            const double sum_term = dotPsiT1(i_c, i_c, j_c, j_c);
+            Psi[i_c][j_c] = -sum_term;
+        }
     }
 
-    // --- 4. Mise à jour des autres lignes (i > 0) ---
-    for (size_t i_c_p = 1; i_c_p < p; ++i_c_p) { // i_c_p = i-1 en Python, démarre à 1
+    // --- 4. Lignes suivantes (i > 0) ---
+    for (size_t i_c_p = 1; i_c_p < p; ++i_c_p) {
         i_c = i_c_p;
-        j_c = i_c + 1;
-        
-        while (j_c < p) { 
-            if (std::abs(A[i_c][j_c]) < 1e-12) { // Si A[i_c, j_c] == 0
-                
-                // Réinitialiser la valeur
-                Psi[i_c][j_c] = 0.0;
-                
-                // Terme 1 (s1*s2 loop) : r = 1 à i-1
-                for (size_t r_c = 0; r_c < i_c; ++r_c) { // r_c = r-1 en Python
-                    
-                    // Calcul de s1
-                    // s1_num = Psi[r-1, i-1] + np.sum(Psi[r-1, (r-1):(i-1)] * T1[(r-1):(i-1), i-1])
-                    double sum_s1_slice = numpySumSlice(Psi, r_c, r_c, i_c, T1, r_c, i_c, i_c);
-                    double s1_num = Psi[r_c][i_c] + sum_s1_slice;
-                    
-                    if (std::abs(Psi[i_c][i_c]) < 1e-18) {
-                        throw std::runtime_error("EchantillonPsiMod: Division par zéro (Psi[i,i] est nul).");
-                    }
-                    double s1 = s1_num / Psi[i_c][i_c];
+        const double psi_ii = Psi[i_c][i_c];
+        if (std::abs(psi_ii) < 1e-18) {
+            throw std::runtime_error("EchantillonPsiMod: Division par zéro (Psi[i,i] est nul).");
+        }
+        const double inv_psi_ii = 1.0 / psi_ii;
 
-                    // Calcul de s2
-                    // s2 = Psi[r-1,j-1] + np.sum(Psi[r-1, (r-1):(j-1)] * T1[(r-1):(j-1), j-1])
-                    double sum_s2_slice = numpySumSlice(Psi, r_c, r_c, j_c, T1, r_c, j_c, j_c);
-                    double s2 = Psi[r_c][j_c] + sum_s2_slice;
+        for (size_t j_c = i_c + 1; j_c < p; ++j_c) {
+            if (std::abs(A[i_c][j_c]) < 1e-12) { // A[i_c, j_c] == 0
 
-                    // Psi[i-1,j-1] = Psi[i-1,j-1]-s1*s2
-                    Psi[i_c][j_c] -= s1 * s2;
+                double psi_ij = 0.0;
+
+                // Terme 1 : somme sur r = 0..i-1
+                for (size_t r_c = 0; r_c < i_c; ++r_c) {
+
+                    // s1_num = Psi[r,i] + sum_{k=r}^{i-1} Psi[r,k] * T1[k,i]
+                    const double s1_num = Psi[r_c][i_c] + dotPsiT1(r_c, r_c, i_c, i_c);
+                    const double s1     = s1_num * inv_psi_ii;
+
+                    // s2 = Psi[r,j] + sum_{k=r}^{j-1} Psi[r,k] * T1[k,j]
+                    const double s2 = Psi[r_c][j_c] + dotPsiT1(r_c, r_c, j_c, j_c);
+
+                    psi_ij -= s1 * s2;
                 }
-                
-                // Terme 2: -1 * np.sum(Psi[i-1,(i-1):(j-1)]*T1[(i-1):(j-1),j-1])
-                double sum_term_2 = numpySumSlice(Psi, i_c, i_c, j_c, T1, i_c, j_c, j_c);
 
-                Psi[i_c][j_c] -= sum_term_2;
+                // Terme 2 : - sum_{k=i}^{j-1} Psi[i,k] * T1[k,j]
+                const double sum_term_2 = dotPsiT1(i_c, i_c, j_c, j_c);
+                psi_ij -= sum_term_2;
+
+                Psi[i_c][j_c] = psi_ij;
             }
-            j_c++;
         }
     }
-    
-    // Le code Python renvoie Psi, qui est modifié par référence
-    return Psi;
+
+    return Psi; // modifié en place, retour pour compatibilité
 }
 
+MCMC_Result_Full MCMC(
+    double lambda_0,
+    const Matrix& B_in,
+    const Matrix& Sigma,
+    double detB_init,
+    const Matrix& Psi_init,
+    const Matrix& T_init,
+    double b,
+    const Matrix& S_epsi,
+    double neta,
+    Matrix& A_Theta,
+    int T_periods,
+    bool verbose // ajout d'un flag pour contrôler les prints
+) {
+    verbose=false;
+    if (verbose)
+        std::cout << "Commencement de l'echantillonnage B" << std::endl;
+    
+    const size_t p = B_in.size();
+    if (p == 0) {
+        throw std::invalid_argument("MCMC: La dimension p est nulle.");
+    }
+    
+    // Copies locales modifiables
+    Matrix B    = B_in;
+    Matrix Psi  = Psi_init;
+    Matrix T    = T_init;
+    Matrix Sigma_current = Sigma;
+    double detB = detB_init;
+    
+    // --- Pré-calcul de T1_star = sqrt(b) * cholesky(Sigma)' ---
+    Matrix cholesky_Sigma = cholesky(Sigma_current);
+    Matrix T1_star(p, Vector(p, 0.0));
+    for (size_t i = 0; i < p; ++i) {
+        for (size_t j = 0; j < p; ++j) {
+            // transposée de cholesky(Sigma)
+            T1_star[i][j] = std::sqrt(b) * cholesky_Sigma[j][i];
+        }
+    }
+    
+    // --- 1. Choix du mouvement (Ajout/Retrait/Rien) ---
+    std::uniform_int_distribution<> action_dist(0, 2); // 0: rien, 1: retrait, 2: ajout
+    int rv = action_dist(generator_prior);
+    std::bernoulli_distribution bernoulli_prop(0.5);
+    
+    Matrix A_Theta_star = A_Theta;
+    Matrix Omega_star   = B;
+    Matrix Sigma_star   = Sigma_current;
+    Matrix Psi_star     = Psi;
+    double detB_star    = detB;
+    
+    PropAjoutRetrait proposal_data;
+    bool Etat = bernoulli_prop(generator_prior); // true = ajout, false = retrait
+    
+    if (rv > 0) {
+        if (verbose) {
+            if (rv == 2) std::cout << "We are adding an edge" << std::endl;
+            else         std::cout << "We are removing an edge" << std::endl;
+        }
+        
+        if (rv == 2) {
+            proposal_data = ajoutUnNoeud(A_Theta);
+        } else {
+            proposal_data = extractNoeud(A_Theta);
+        }
+        A_Theta_star = proposal_data.A;
+    }
 
+    // On alloue B_star une fois pour toutes
+    Matrix B_star(p, Vector(p, 0.0));
+
+    // --- 2. Boucle de tentative de mise à jour (max 10 essais) ---
+    int  it         = 0;
+    bool continuous = true;
+    
+    while (continuous && it <= 10) {
+        if (verbose)
+            std::cout << "Iteration locale MCMC = " << it << std::endl;
+        ++it;
+        
+        // Échantillonner Psi_star
+        if (rv == 0) {
+            // Échantillonnage sous la structure actuelle
+            Psi_star = EchantillonPsi(A_Theta, T1_star, b);
+        } else {
+            // Échantillonnage sous la structure proposée (mouvement MH)
+            Psi_star = EchantillonPsiMod(
+                Psi, A_Theta_star, T1_star, b,
+                proposal_data.i0, proposal_data.j0, Etat
+            );
+        }
+        
+        // Calculer Omega*, Sigma*, detB*
+        MatricesPrecision MP_star = precisionMatrix(Psi_star);
+        Omega_star = MP_star.Omega;
+        Sigma_star = MP_star.Sigma;
+        detB_star  = MP_star.detb; // on suppose que c'est le log-det B*
+        
+        // Calculer B_star = Omega* * sqrt(diag(Sigma*))
+        // -> à vérifier avec ton modèle, c'est ce que suggère ton commentaire.
+        for (size_t r = 0; r < p; ++r) {
+            const double sqrtSigma_r = std::sqrt(Sigma_star[r][r]);
+            for (size_t c = 0; c < p; ++c) {
+                const double sqrtSigma_c = std::sqrt(Sigma_star[c][c]);
+                B_star[r][c] = Omega_star[r][c] * sqrtSigma_r * sqrtSigma_c; 
+                //B_star[r][c] = Omega_star[r][c]; 
+               Sigma_star[r][c] = Sigma_star[r][c]/( sqrtSigma_r * sqrtSigma_c);
+            }
+            detB_star+=std::log(Omega_star[r][r]);
+        }
+
+        // --- 3. Vérification de la définie positivité ---
+        try {
+            // Ici tu utilises detB_star comme critère.
+            // Si detB_star est un log-det, le seuil est à adapter.
+            const double det_omega_star = detB_star;
+            if (det_omega_star > 1e-12) {
+                continuous = false;
+            }
+        } catch (const std::exception&) {
+            // Si det() plante, on rejette la proposition en restant dans la boucle
+        }
+        
+        // --- 4. MH : seulement si on a un mouvement de structure et matrice valide ---
+        if (!continuous && rv > 0) {
+            // a) Terme Wishart (l1)
+            double l1 = detB_star - detB;
+            double correction_factor =
+                -1.0 * (neta + static_cast<double>(p) - static_cast<double>(T_periods)
+                        + 0.5 * (b - 2.0));
+            l1 *= correction_factor;
+            
+            // b) Terme d'erreur (trace((B* - B) S_epsi))
+            double trace_term = 0.0;
+            for (size_t i = 0; i < p; ++i) {
+                for (size_t k = 0; k < p; ++k) {
+                    trace_term += (B_star[i][k] - B[i][k]) * S_epsi[k][i];
+                }
+            }
+            trace_term *= -0.5;
+            
+            // c) LASSO : -lambda_0 * (||B*||_1 - ||B||_1)
+            const double SumAbs_B_star = SumAbsMatrix(B_star);
+            const double SumAbs_B      = SumAbsMatrix(B);
+            const double lasso_term    = -lambda_0 * (SumAbs_B_star - SumAbs_B);
+            
+            // d) Correction diagonale
+            double diag_prior_correction = 0.0;
+            for (size_t k = 0; k < p; ++k) {
+                diag_prior_correction += (B_star[k][k] - B[k][k]);
+            }
+            
+            const double cste = l1 + trace_term + lasso_term + diag_prior_correction;
+            if (verbose)
+                std::cout << "log-alpha (cste) = " << cste << std::endl;
+            
+            // e) Acceptation MH
+            if (logUniformRvs() <= cste) {
+                if (verbose)
+                    std::cout << "### Acceptation : mise a jour de la matrice de precision ###"
+                              << std::endl;
+                
+                B             = B_star;
+                A_Theta       = A_Theta_star;
+                Sigma_current = Sigma_star;
+                detB          = detB_star;
+                Psi           = Psi_star;
+                T             = T1_star;
+            }
+        }
+    }
+    
+    if (verbose)
+        std::cout << "Fin de l'echantillonnage local" << std::endl;
+
+    MCMC_Result_Full result;
+    result.Psi      = Psi;
+    result.T        = T;
+    result.B        = B;
+    result.Sigma    = Sigma_current;
+    result.detB     = detB;
+    result.A_Theta  = A_Theta;
+    
+    return result;
+}
 // --- Fonction MCMC Principale ---
-MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_init, Matrix& Psi_init, Matrix& T_init, double b, const Matrix& S_epsi, double neta, Matrix& A_Theta, int T_periods) {
+/* MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_init, Matrix& Psi_init, Matrix& T_init, double b, const Matrix& S_epsi, double neta, Matrix& A_Theta, int T_periods) {
     
     std::cout << "Commencement de lechantillon B" << std::endl;
     
@@ -2230,33 +2496,39 @@ MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_
         MatricesPrecision MP_star = precisionMatrix(Psi_star);
         Omega_star = MP_star.Omega;
         Sigma_star = MP_star.Sigma;
+        detB_star=MP_star.detb;
         
         // Calculer B_star = Omega* * sqrt(diag(Sigma*))
+        // ICI ICI ICI ICI ICI ICI ICI ICI ICI ICI ICI 
+
         Matrix B_star(p, Vector(p));
         for (size_t r = 0; r < p; ++r) {
             for (size_t c = 0; c < p; ++c) {
-                B_star[r][c] = Omega_star[r][c] * std::sqrt(Sigma_star[r][r] * Sigma_star[c][c]);
+               // B_star[r][c] = Omega_star[r][c] * std::sqrt(Sigma_star[r][r] * Sigma_star[c][c]);
+               B_star[r][c] = Omega_star[r][c] ;
+               //;* std::sqrt(Sigma_star[r][r] * Sigma_star[c][c]);
             }
-        }
+        } 
 
         // --- 3. Vérification de la Définie Positivité (Eigenvalue Check) ---
         // Placeholder: Cette vérification est difficile sans une librairie externe.
         // Nous allons supposer que le calcul du déterminant suffit pour la non-singularité.
         try {
-            double det_omega_star = det(Omega_star);
+            //double det_omega_star = det(Omega_star);
+            double det_omega_star = detB_star;
             if (det_omega_star > 1e-12) {
                 continuous = false; // Sortir de la boucle si la matrice est non singulière
             }
         } catch (const std::exception& e) {
             // En cas d'erreur de déterminant, on rejette la proposition
-        }
+        } 
         
         // --- Si rv > 0 (Proposition de structure) : Calcul du Ratio MH ---
         if (!continuous && rv > 0) { // Si Psi* est valide et que c'était un mouvement de structure
             
             // a) Terme Wishart (l1) : Log-Déterminant Ratio
             // Calculer l1 = detB_star - detB (Log-ratio de déterminants)
-            detB_star = 2.0 * std::log(std::abs(det(Psi_star))); // Calcul précis du detB* (log-déterminant)
+           // detB_star = 2.0 * std::log(std::abs(det(Psi_star))); // Calcul précis du detB* (log-déterminant)
             double l1 = detB_star - detB;
             
             // Terme de correction des degrés de liberté
@@ -2313,7 +2585,7 @@ MCMC_Result_Full MCMC(double lambda_0, Matrix& B_in, Matrix& Sigma, double detB_
     result.A_Theta = A_Theta;
     
     return result;
-}
+} */
 
 
 // Matrice diviser par une constante
@@ -2341,4 +2613,338 @@ Matrix DivideMatrixByScalar(const Matrix& M, double C) {
         }
     }
     return Result;
+}
+
+// CRPS empirique à partir d'un échantillon prédictif y_samples et d'une observation x_obs.
+//
+// Formule : CRPS = (1/n) * sum |y_i - x| - (1/n^2) * sum_{i<j} (y_j - y_i)
+// (en utilisant que E|Y-Y'| = 2/(n^2) * sum_{i<j} (y_j - y_i) quand l'échantillon est trié)
+double crpsFromSamples(const std::vector<double>& y_samples, double x_obs)
+{
+    const std::size_t n = y_samples.size();
+    if (n == 0) {
+        throw std::invalid_argument("crps_from_samples: l'échantillon y_samples est vide.");
+    }
+
+    // Copie triée de l'échantillon
+    std::vector<double> y = y_samples;
+    std::sort(y.begin(), y.end());
+
+    // 1) terme (1/n) * sum |y_i - x|
+    double sum_abs_y_minus_x = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        sum_abs_y_minus_x += std::fabs(y[i] - x_obs);
+    }
+    const double term1 = sum_abs_y_minus_x / static_cast<double>(n);
+
+    // 2) terme (1/n^2) * sum_{i<j} (y_j - y_i)
+    //
+    // On utilise l'identité :
+    //   sum_{i<j} (y_j - y_i) = sum_{k=0}^{n-1} (2k - n + 1) * y_k
+    // lorsque le vecteur y est trié.
+    double sum_weighted = 0.0;
+    for (std::size_t k = 0; k < n; ++k) {
+        double coeff = static_cast<double>(2 * static_cast<long long>(k) - static_cast<long long>(n) + 1);
+        sum_weighted += coeff * y[k];
+    }
+
+    // E|Y - Y'| = 2/(n^2) * sum_{i<j} (y_j - y_i) = 2/(n^2) * sum_weighted
+    const double EYminusYprime = 2.0 * sum_weighted / (static_cast<double>(n) * static_cast<double>(n));
+
+    // CRPS = E|Y - x| - 0.5 * E|Y - Y'|
+    const double crps = term1 - 0.5 * EYminusYprime;
+    return crps;
+}
+
+// Sample of the CRPS 
+Vector crpsVector(const Matrix& Y_sample,const Vector& y_obs)
+{
+    size_t p =y_obs.size();  // number of rows
+    size_t n_sample = Y_sample[0].size();  // number of colon 
+    Vector column(n_sample);
+    Vector tp(p,0);
+    for (size_t j=0; j<p;++j)
+    {
+        for (std::size_t i = 0; i < n_sample; ++i) {
+        column[i] = Y_sample[i][j];
+     }
+        tp[j]=crpsFromSamples(column,y_obs[j]);
+    }  
+    return tp;
+}
+
+// rowMeans 
+Vector rowMeans(const Matrix& M) {
+    std::size_t p = M.size();
+    if (p == 0) return Vector();
+
+    std::size_t n_sample = M[0].size();
+
+    // Vérification que toutes les lignes ont la même taille
+    for (const auto& row : M) {
+        if (row.size() != n_sample) {
+            throw std::invalid_argument("rowMeans: dimensions incohérentes dans la matrice.");
+        }
+    }
+
+    Vector means(p, 0.0);
+
+    for (std::size_t i = 0; i < p; ++i) {
+        double sum = 0.0;
+        for (std::size_t j = 0; j < n_sample; ++j) {
+            sum += M[i][j];
+        }
+        means[i] = sum / static_cast<double>(n_sample);
+    }
+
+    return means;
+}
+
+
+// exportation en fichier .txt
+
+void exportMatrixTxt(const Matrix& M, const std::string& filename) {
+    std::ofstream out(filename);
+
+    if (!out.is_open()) {
+        throw std::runtime_error("Impossible d'ouvrir le fichier : " + filename);
+    }
+
+    for (const auto& row : M) {
+        for (std::size_t j = 0; j < row.size(); ++j) {
+            out << row[j];
+            if (j + 1 < row.size()) out << " ";  // séparateur (espace)
+        }
+        out << "\n";  // nouvelle ligne pour chaque row
+    }
+
+    out.close();
+}
+
+
+
+void print_vector(const Vector& vec, const std::string& name) {
+    
+    std::cout << name << " [Taille: " << vec.size() << "] : [" << std::endl;
+    
+    // Définir le formatage pour tous les éléments suivants
+    // std::fixed : Force la notation à point fixe (non scientifique)
+    // std::setprecision(6) : Définit le nombre de chiffres après la virgule à 6
+    std::cout << std::fixed << std::setprecision(6);
+    
+    // Affichage des éléments
+    for (double element : vec) {
+        std::cout << "  " << element;
+    }
+    
+    // Réinitialiser le formatage si nécessaire après l'appel (non obligatoire)
+    std::cout << std::defaultfloat << std::setprecision(0); 
+    
+    std::cout << "\n]" << std::endl;
+} 
+
+
+// exportation sous forme de fichier CSV
+void saveMatrixCSV(const Matrix& M, const std::string& filename) {
+    std::ofstream file(filename);
+
+    if (!file.is_open())
+        throw std::runtime_error("Impossible d'ouvrir le fichier " + filename);
+
+    for (const auto& row : M) {
+        for (size_t j = 0; j < row.size(); ++j) {
+            file << row[j];
+            if (j + 1 < row.size()) file << ",";  // séparateur CSV
+        }
+        file << "\n";
+    }
+}
+
+
+
+// exporter un vecteur en TXT
+void saveVectorTXT(const std::vector<double>& v, const std::string& filename) {
+    std::ofstream file(filename);
+
+    if (!file.is_open())
+        throw std::runtime_error("Impossible d'ouvrir le fichier " + filename);
+
+    for (double val : v) {
+        file << val << "\n";   // un élément par ligne
+    }
+}
+
+//exporter un vecteur en CSV
+void saveVectorCSV(const std::vector<double>& v, const std::string& filename) {
+    std::ofstream file(filename);
+
+    if (!file.is_open())
+        throw std::runtime_error("Impossible d'ouvrir le fichier " + filename);
+
+    for (size_t i = 0; i < v.size(); ++i) {
+        file << v[i];
+        if (i + 1 < v.size()) file << ",";  // séparateur CSV
+    }
+
+    file << "\n";
+}
+
+// Calcule l'écart-type de chaque ligne d'une matrice.
+// Retourne un Vector contenant l'écart-type par ligne.
+Vector RowsStd(const Matrix& mat) {
+    std::size_t nRows = mat.size();
+    if (nRows == 0) {
+        throw std::invalid_argument("La matrice est vide.");
+    }
+
+    Vector stdRows(nRows);
+
+    for (std::size_t i = 0; i < nRows; ++i) {
+
+        std::size_t nCols = mat[i].size();
+        if (nCols == 0) {
+            throw std::invalid_argument("Une ligne de la matrice est vide.");
+        }
+
+        // 1) Moyenne de la ligne
+        double sum = 0.0;
+        for (std::size_t j = 0; j < nCols; ++j) {
+            sum += mat[i][j];
+        }
+        double mean = sum / nCols;
+
+        // 2) Somme des carrés des écarts
+        double sqSum = 0.0;
+        for (std::size_t j = 0; j < nCols; ++j) {
+            double diff = mat[i][j] - mean;
+            sqSum += diff * diff;
+        }
+
+        // 3) Ecart-type (population)
+        double variance = sqSum / nCols;
+        stdRows[i] = std::sqrt(variance/nCols);
+
+        // Pour écart-type échantillon → std::sqrt(sqSum / (nCols - 1))
+    }
+
+    return stdRows;
+}
+
+
+Vector VectorDifference(const Vector& v1, const Vector& v2) {
+    std::size_t n = v1.size();
+    if (n != v2.size()) {
+        throw std::invalid_argument("Les vecteurs doivent avoir la même taille.");
+    }
+
+    Vector result(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        result[i] = v1[i] - v2[i];
+    }
+
+    return result;
+}
+
+// calcul de la moyenne d'un vecteur
+
+double mean(const std::vector<double>& v) {
+    if (v.empty())
+        throw std::invalid_argument("mean: vecteur vide");
+
+    double sum = std::accumulate(v.begin(), v.end(), 0.0);
+    return sum / static_cast<double>(v.size());
+}
+
+
+// linespace sur C++ on retourne un vecteur s
+
+Vector linspace(double a, double b, std::size_t n) {
+    if (n == 0) return {};
+    if (n == 1) return {a};
+
+    std::vector<double> x(n);
+    double step = (b - a) / static_cast<double>(n - 1);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        x[i] = a + step * static_cast<double>(i);
+    }
+    return x;
+}
+
+
+
+// courbe 
+
+// Trace une courbe (x,y) en PNG avec fond gris et courbe bleue
+void plotCurveToPNG(const std::vector<double>& x,
+                    const std::vector<double>& y,
+                    const std::string& filename,
+                    const std::string& title,
+                    const std::string& xlabel,
+                    const std::string& ylabel )
+{
+    if (x.size() != y.size() || x.size() < 2) {
+        throw std::invalid_argument("plotCurveToPNG: x et y doivent avoir la même taille >= 2.");
+    }
+
+    // Conversion en PLFLT
+    std::vector<PLFLT> xx(x.size()), yy(y.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        xx[i] = static_cast<PLFLT>(x[i]);
+        yy[i] = static_cast<PLFLT>(y[i]);
+    }
+
+    // Bornes automatiques
+    auto [xmin_it, xmax_it] = std::minmax_element(x.begin(), x.end());
+    auto [ymin_it, ymax_it] = std::minmax_element(y.begin(), y.end());
+
+    double xmin = *xmin_it, xmax = *xmax_it;
+    double ymin = *ymin_it, ymax = *ymax_it;
+
+    double padx = 0.05 * (xmax - xmin);
+    double pady = 0.05 * (ymax - ymin);
+    xmin -= padx; xmax += padx;
+    ymin -= pady; ymax += pady;
+
+    plstream pls;
+
+    // --- Driver PNG ---
+    pls.sdev("pngcairo");
+    pls.sfnam(filename.c_str());
+
+    // --- Palette de couleurs ---
+    // Couleur 0 = fond
+    pls.scol0(0, 220, 220, 220);   // gris clair
+
+    // Couleur 1 = axes / texte
+    pls.scol0(1,   0,   0,   0);   // noir
+
+    // Couleur 2 = courbe
+    pls.scol0(2,  30,  90, 200);   // bleu
+
+    pls.init();
+
+    // --- Cadre + axes ---
+    pls.col0(1); // noir pour axes et texte
+    pls.env(xmin, xmax, ymin, ymax, 0, 0);
+
+    // --- Titre et labels ---
+    pls.lab(xlabel.c_str(), ylabel.c_str(), title.c_str());
+
+    // --- Courbe ---
+    pls.col0(2); // bleu
+    pls.line(static_cast<PLINT>(xx.size()), xx.data(), yy.data());
+
+    pls.eop(); // écrit le fichier PNG
+}
+
+
+// index du maximum
+
+size_t index_of_min(const std::vector<double>& v) {
+    if (v.empty())
+        throw std::invalid_argument("index_of_max: vecteur vide");
+
+    return std::distance(v.begin(),
+                         std::min_element(v.begin(), v.end()));
 }

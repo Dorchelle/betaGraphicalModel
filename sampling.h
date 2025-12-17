@@ -18,5 +18,6 @@ extern std::mt19937 generator_prior;
 using Matrix = std::vector<std::vector<double>>;
 using Vector = std::vector<double>;
 
-int sample_discrete(const Vector& probabilities);
+int sampleDiscrete(const Vector& probabilities);
 double sampleBeta(double alpha, double beta);
+double sampleGamma(double shape, double scale); // gamma distribution
